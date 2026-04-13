@@ -1,0 +1,347 @@
+// API client for backend communication
+import Constants from 'expo-constants';
+
+// Get API URL from environment variable or Expo config
+const getApiBaseUrl = () => {
+  // First try process.env (works in development and if set at build time)
+  if (process.env.EXPO_PUBLIC_API_URL) {
+    return process.env.EXPO_PUBLIC_API_URL;
+  }
+  
+  // Fallback to Expo Constants (works in APK builds)
+  if (Constants.expoConfig?.extra?.EXPO_PUBLIC_API_URL) {
+    return Constants.expoConfig.extra.EXPO_PUBLIC_API_URL;
+  }
+  
+  // Final fallback
+  return 'http://64.227.150.214:3000/api';
+};
+
+const API_BASE_URL = getApiBaseUrl();
+// Import FileSystem for React Native file operations
+let FileSystem: any = null;
+if (typeof window === 'undefined' || !window.File) {
+  // React Native environment - try to import expo-file-system
+  try {
+    FileSystem = require('expo-file-system');
+  } catch (e) {
+    console.warn('expo-file-system not available');
+  }
+}
+
+// Log API base URL on module load (for debugging)
+console.log('API Base URL:', API_BASE_URL);
+
+async function apiRequest(endpoint: string, options: RequestInit = {}) {
+  try {
+    const url = `${API_BASE_URL}${endpoint}`;
+    console.log('API Request:', url, options.method || 'GET');
+    
+    const response = await fetch(url, {
+      headers: {
+        'Content-Type': 'application/json',
+        ...options.headers,
+      },
+      ...options,
+    });
+
+    let data;
+    try {
+      const text = await response.text();
+      data = text ? JSON.parse(text) : {};
+    } catch (parseError) {
+      console.error('Failed to parse response:', parseError);
+      throw new Error(`Invalid response from server (status: ${response.status})`);
+    }
+
+    // Check if response is ok (status 200-299)
+    if (!response.ok) {
+      const errorMessage = data.error || data.message || `Server error (${response.status})`;
+      console.error('API Error:', errorMessage, 'Status:', response.status);
+      return { success: false, error: errorMessage };
+    }
+
+    return data;
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Network error';
+    console.error('API Request failed:', errorMessage, 'Endpoint:', endpoint);
+    
+    // Provide more helpful error messages
+    if (errorMessage.includes('Network request failed') || errorMessage.includes('fetch')) {
+      throw new Error('Cannot connect to server. Make sure the backend is running and your device is on the same WiFi network.');
+    }
+    
+    throw new Error(errorMessage);
+  }
+}
+
+export const api = {
+  // Auth endpoints
+  signUp: (phone: string, password: string) =>
+    apiRequest('/auth/signup', {
+      method: 'POST',
+      body: JSON.stringify({ phone, password }),
+    }),
+
+  login: (phone: string, password: string) =>
+    apiRequest('/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ phone, password }),
+    }),
+
+  sendOTP: (phone: string) =>
+    apiRequest('/auth/send-otp', {
+      method: 'POST',
+      body: JSON.stringify({ phone }),
+    }),
+
+  verifyOTP: (phone: string, otp: string) =>
+    apiRequest('/auth/verify-otp', {
+      method: 'POST',
+      body: JSON.stringify({ phone, otp }),
+    }),
+
+  completeProfile: (userId: string, profileData: any) =>
+    apiRequest('/auth/complete-profile', {
+      method: 'PUT',
+      body: JSON.stringify({ userId, ...profileData }),
+    }),
+
+  getProfile: (userId: string) =>
+    apiRequest(`/auth/profile/${userId}`, {
+      method: 'GET',
+    }),
+
+  // Public endpoints for categories and templates
+  getCategories: () => apiRequest('/categories', { method: 'GET' }),
+  
+  getTemplates: (params?: { category?: string; search?: string }) => {
+    const queryParams = new URLSearchParams();
+    if (params?.category) queryParams.append('category', params.category);
+    if (params?.search) queryParams.append('search', params.search);
+    const query = queryParams.toString();
+    return apiRequest(`/templates${query ? `?${query}` : ''}`, { method: 'GET' });
+  },
+
+  // Location endpoints
+  getStates: () => apiRequest('/locations/states', { method: 'GET' }),
+  getDistricts: (stateId: string) => apiRequest(`/locations/districts?state_id=${stateId}`, { method: 'GET' }),
+  getTehsils: (districtId: string) => apiRequest(`/locations/tehsils?district_id=${districtId}`, { method: 'GET' }),
+
+  // Political parties endpoint
+  getPoliticalParties: () => apiRequest('/political-parties', { method: 'GET' }),
+
+  // Upload profile photo
+  uploadProfilePhoto: async (userId: string, photoUri: string) => {
+    // Check if we're on web or native
+    const isWeb = typeof window !== 'undefined' && typeof File !== 'undefined';
+    
+    console.log('Uploading profile photo:', { userId, photoUri, isWeb });
+
+    try {
+      if (isWeb) {
+        // For web, use fetch with FormData
+        const formData = new FormData();
+        const response = await fetch(photoUri);
+        if (!response.ok) {
+          throw new Error(`Failed to fetch image: ${response.status} ${response.statusText}`);
+        }
+        const blob = await response.blob();
+        if (!blob || blob.size === 0) {
+          throw new Error('Image file is empty or could not be read. Please select a valid image file.');
+        }
+        const filename = 'profile-photo.jpg';
+        formData.append('photo', blob, filename);
+        formData.append('userId', userId);
+
+        const uploadResponse = await fetch(`${API_BASE_URL}/auth/upload-profile-photo`, {
+          method: 'POST',
+          body: formData,
+        });
+
+        const responseText = await uploadResponse.text();
+        console.log('Upload response status:', uploadResponse.status);
+        console.log('Upload response:', responseText);
+
+        if (!uploadResponse.ok) {
+          let errorData;
+          try {
+            errorData = JSON.parse(responseText);
+          } catch {
+            errorData = { error: responseText || 'Upload failed' };
+          }
+          throw new Error(errorData.error || `Upload failed with status ${uploadResponse.status}`);
+        }
+
+        return JSON.parse(responseText);
+      } else {
+        // For React Native, handle file uploads properly
+        // content:// URIs on Android need special handling
+        return new Promise(async (resolve, reject) => {
+          try {
+            let uploadUri = photoUri;
+            
+            // Handle content:// URIs on Android by copying to temporary file:// location
+            if (photoUri.startsWith('content://') && FileSystem) {
+              try {
+                console.log('Converting content:// URI to file:// URI');
+                // Create a temporary file path
+                const tempFileName = `temp_${Date.now()}_${Math.random().toString(36).substring(7)}.jpg`;
+                const tempUri = `${FileSystem.cacheDirectory}${tempFileName}`;
+                
+                // Copy the file from content:// to file://
+                await FileSystem.copyAsync({
+                  from: photoUri,
+                  to: tempUri,
+                });
+                
+                // Verify the copied file
+                const fileInfo = await FileSystem.getInfoAsync(tempUri);
+                if (!fileInfo.exists || fileInfo.size === 0) {
+                  reject(new Error('Failed to copy file. Please try again.'));
+                  return;
+                }
+                
+                console.log('File copied successfully:', { from: photoUri, to: tempUri, size: fileInfo.size });
+                uploadUri = tempUri;
+                
+                // Clean up temp file after upload (in finally block)
+              } catch (copyError) {
+                console.error('Error copying file:', copyError);
+                reject(new Error('Failed to process image. Please try again.'));
+                return;
+              }
+            } else if (FileSystem) {
+              // Verify file exists for file:// URIs
+              try {
+                const fileInfo = await FileSystem.getInfoAsync(photoUri);
+                if (!fileInfo.exists) {
+                  reject(new Error('Selected file does not exist. Please select a valid image.'));
+                  return;
+                }
+                console.log('File info:', { exists: fileInfo.exists, size: fileInfo.size, uri: photoUri });
+                if (fileInfo.size === 0) {
+                  reject(new Error('Selected file is empty. Please select a valid image.'));
+                  return;
+                }
+              } catch (fileError) {
+                console.warn('Could not verify file info:', fileError);
+              }
+            }
+            
+            // Ensure URI is not a data URI
+            if (uploadUri.startsWith('data:')) {
+              reject(new Error('Data URIs are not supported. Please use a file URI.'));
+              return;
+            }
+            
+            const formData = new FormData();
+            
+            // Extract filename and determine MIME type
+            const filename = uploadUri.split('/').pop() || 'profile-photo.jpg';
+            const match = /\.(\w+)$/.exec(filename.toLowerCase());
+            let mimeType = 'image/jpeg';
+            if (match) {
+              const ext = match[1].toLowerCase();
+              if (ext === 'png') mimeType = 'image/png';
+              else if (ext === 'gif') mimeType = 'image/gif';
+              else if (ext === 'jpg' || ext === 'jpeg') mimeType = 'image/jpeg';
+            }
+            
+            console.log('Uploading with XMLHttpRequest:', { 
+              originalUri: photoUri, 
+              uploadUri, 
+              filename, 
+              mimeType, 
+              userId 
+            });
+            
+            formData.append('photo', {
+              uri: uploadUri,
+              type: mimeType,
+              name: filename,
+            } as any);
+            formData.append('userId', userId);
+
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', `${API_BASE_URL}/auth/upload-profile-photo`);
+            
+            // Track upload progress
+            xhr.upload.onprogress = (event) => {
+              if (event.lengthComputable) {
+                const percentComplete = (event.loaded / event.total) * 100;
+                console.log(`Upload progress: ${percentComplete.toFixed(2)}%`);
+              }
+            };
+            
+            xhr.onload = () => {
+              // Clean up temp file if we created one
+              if (uploadUri !== photoUri && FileSystem) {
+                FileSystem.deleteAsync(uploadUri, { idempotent: true }).catch(err => {
+                  console.warn('Failed to delete temp file:', err);
+                });
+              }
+              
+              console.log('Upload response status:', xhr.status);
+              console.log('Upload response:', xhr.responseText);
+              
+              if (xhr.status >= 200 && xhr.status < 300) {
+                try {
+                  const data = JSON.parse(xhr.responseText);
+                  console.log('Upload successful:', data);
+                  resolve(data);
+                } catch (error) {
+                  console.error('Error parsing upload response:', error);
+                  reject(new Error('Invalid response from server'));
+                }
+              } else {
+                let errorData;
+                try {
+                  errorData = JSON.parse(xhr.responseText);
+                } catch {
+                  errorData = { error: xhr.responseText || 'Upload failed' };
+                }
+                reject(new Error(errorData.error || `Upload failed with status ${xhr.status}`));
+              }
+            };
+            
+            xhr.onerror = () => {
+              // Clean up temp file on error
+              if (uploadUri !== photoUri && FileSystem) {
+                FileSystem.deleteAsync(uploadUri, { idempotent: true }).catch(err => {
+                  console.warn('Failed to delete temp file:', err);
+                });
+              }
+              console.error('Upload network error');
+              reject(new Error('Network error during upload'));
+            };
+            
+            xhr.ontimeout = () => {
+              // Clean up temp file on timeout
+              if (uploadUri !== photoUri && FileSystem) {
+                FileSystem.deleteAsync(uploadUri, { idempotent: true }).catch(err => {
+                  console.warn('Failed to delete temp file:', err);
+                });
+              }
+              console.error('Upload timeout');
+              reject(new Error('Upload timeout'));
+            };
+            
+            // Set timeout to 30 seconds
+            xhr.timeout = 30000;
+            
+            // Don't set Content-Type header - let XMLHttpRequest set it with boundary
+            xhr.send(formData);
+          } catch (error) {
+            console.error('Upload setup error:', error);
+            reject(new Error(error instanceof Error ? error.message : 'Upload failed'));
+          }
+        });
+      }
+    } catch (error) {
+      console.error('Upload profile photo error:', error);
+      throw new Error(error instanceof Error ? error.message : 'Network error');
+    }
+  },
+};
+

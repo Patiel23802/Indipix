@@ -1,0 +1,1688 @@
+import React, { useState, useRef, useEffect } from 'react';
+import {
+  View,
+  Text,
+  StyleSheet,
+  TouchableOpacity,
+  Image,
+  Dimensions,
+  ScrollView,
+  PanResponder,
+  Animated,
+  TextInput,
+  Alert,
+  Platform,
+} from 'react-native';
+import { LinearGradient } from 'expo-linear-gradient';
+import { X, Undo2, Redo2, Download, Edit, Type, Palette, Image as ImageIcon, Square, Smile } from 'lucide-react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import ViewShot from 'react-native-view-shot';
+import * as Sharing from 'expo-sharing';
+import { COLORS } from '@/constants/colors';
+import { useAuth } from '@/context/AuthContext';
+import { api } from '@/lib/api';
+
+const { width, height } = Dimensions.get('window');
+
+interface TextElement {
+  id: string;
+  text: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  fontSize: number;
+  color: string;
+  fontFamily: string;
+  textAlign?: 'left' | 'center' | 'right';
+  textShadow?: boolean | 'small' | 'medium' | 'large';
+}
+
+interface Template {
+  id: string;
+  name: string;
+  category_slug: string;
+  category_name?: string;
+  description: string | null;
+  file_url: string;
+  file_format: string;
+  aspect_ratio: string;
+  status: string;
+}
+
+interface TemplateEditorProps {
+  template: Template;
+  onBack: () => void;
+  onSave: () => void;
+  continueEditing?: boolean; // If true, load saved state; if false/undefined, start fresh
+}
+
+export function TemplateEditor({ template, onBack, onSave, continueEditing = false }: TemplateEditorProps) {
+  const { state } = useAuth();
+  const [textElements, setTextElements] = useState<TextElement[]>([]);
+  const [selectedTextId, setSelectedTextId] = useState<string | null>(null);
+  const [editingTextId, setEditingTextId] = useState<string | null>(null);
+  const [showTextProperties, setShowTextProperties] = useState(false);
+  const [activeProperty, setActiveProperty] = useState<'font' | 'color' | 'size' | 'shadow' | 'format' | null>(null);
+  const [history, setHistory] = useState<TextElement[][]>([[]]);
+  const [historyIndex, setHistoryIndex] = useState(0);
+  const [partyLogo, setPartyLogo] = useState<string | null>(null);
+  const [showLogo, setShowLogo] = useState(false);
+  const [profilePhoto, setProfilePhoto] = useState<string | null>(null);
+  const [isDownloading, setIsDownloading] = useState(false);
+  const [imageDimensions, setImageDimensions] = useState<{ width: number; height: number } | null>(null);
+  const canvasRef = useRef<ViewShot>(null);
+
+  const getFileUrl = (fileUrl: string) => {
+    if (fileUrl.startsWith('http')) {
+      return fileUrl;
+    }
+    // Extract base URL without /api suffix for static files (uploads)
+    const API_BASE_URL = process.env.EXPO_PUBLIC_API_URL || 'http://localhost:3000/api';
+    const baseUrl = API_BASE_URL.replace(/\/api$/, ''); // Remove /api suffix if present
+    return `${baseUrl}${fileUrl}`;
+  };
+
+  const templateImageUrl = template.file_url ? getFileUrl(template.file_url) : null;
+  // Use full width minus minimal padding to maximize canvas size
+  const canvasWidth = width - 32;
+  
+  // Parse aspect ratio from template (e.g., "4:5", "9:16", "1:1", "16:9")
+  const parseAspectRatio = (ratio: string): number => {
+    const parts = ratio.split(':');
+    if (parts.length === 2) {
+      const w = parseFloat(parts[0]);
+      const h = parseFloat(parts[1]);
+      if (w > 0 && h > 0) {
+        return h / w; // Return height/width ratio
+      }
+    }
+    // If we have actual image dimensions, use those
+    if (imageDimensions) {
+      return imageDimensions.height / imageDimensions.width;
+    }
+    return 5 / 4; // Default to 4:5 if parsing fails
+  };
+  
+  const aspectRatio = parseAspectRatio(template.aspect_ratio || '4:5');
+  const canvasHeight = canvasWidth * aspectRatio;
+  
+  // Handle image load to get actual dimensions
+  const handleImageLoad = (event: any) => {
+    if (event?.nativeEvent?.source) {
+      const { width: imgWidth, height: imgHeight } = event.nativeEvent.source;
+      if (imgWidth && imgHeight) {
+        setImageDimensions({ width: imgWidth, height: imgHeight });
+      }
+    }
+  };
+
+  // Storage key for auto-save (include user ID to isolate per user)
+  const storageKey = `template_editor_${state.user?.id || 'anonymous'}_${template.id}`;
+
+  // Load saved state on mount only if continueEditing is true
+  useEffect(() => {
+    if (continueEditing) {
+      loadSavedState();
+    }
+    fetchPartyLogo();
+    fetchProfilePhoto();
+  }, [continueEditing]);
+
+  // Auto-save whenever textElements change (debounced)
+  useEffect(() => {
+    const saveTimer = setTimeout(() => {
+      saveState();
+    }, 1000); // Save 1 second after last change
+
+    return () => clearTimeout(saveTimer);
+  }, [textElements, showLogo, profilePhoto]);
+
+  const loadSavedState = async () => {
+    try {
+      const savedData = await AsyncStorage.getItem(storageKey);
+      if (savedData) {
+        const parsed = JSON.parse(savedData);
+        if (parsed.textElements && parsed.textElements.length > 0) {
+          setTextElements(parsed.textElements);
+          setHistory([parsed.textElements]);
+          setHistoryIndex(0);
+        }
+        if (parsed.showLogo !== undefined) {
+          setShowLogo(parsed.showLogo);
+        }
+        if (parsed.profilePhoto) {
+          setProfilePhoto(parsed.profilePhoto);
+        }
+      }
+    } catch (error) {
+      console.error('Error loading saved state:', error);
+    }
+  };
+
+  const saveState = async () => {
+    try {
+      const stateToSave = {
+        textElements,
+        showLogo,
+        profilePhoto,
+        templateId: template.id,
+        templateName: template.name,
+        lastSaved: Date.now(),
+      };
+      await AsyncStorage.setItem(storageKey, JSON.stringify(stateToSave));
+      console.log('Saved template state:', storageKey, stateToSave);
+    } catch (error) {
+      console.error('Error saving state:', error);
+    }
+  };
+
+  const handleDownload = async () => {
+    try {
+      setIsDownloading(true);
+      
+      if (Platform.OS === 'web') {
+        // Web-specific implementation using Canvas API
+        await downloadWebImage();
+      } else {
+        // Native implementation using ViewShot
+        if (!canvasRef.current || !canvasRef.current.capture) {
+          Alert.alert('Error', 'Canvas not ready. Please try again.');
+          setIsDownloading(false);
+          return;
+        }
+        
+        const uri = await canvasRef.current.capture();
+        
+        if (!uri) {
+          Alert.alert('Error', 'Failed to capture image. Please try again.');
+          setIsDownloading(false);
+          return;
+        }
+
+        // Check if sharing is available
+        const isAvailable = await Sharing.isAvailableAsync();
+        
+        if (isAvailable) {
+          await Sharing.shareAsync(uri, {
+            mimeType: 'image/png',
+            dialogTitle: 'Save your template',
+          });
+          Alert.alert('Success', 'Image saved successfully!');
+        } else {
+          Alert.alert('Error', 'Sharing is not available on this device.');
+        }
+      }
+    } catch (error) {
+      console.error('Error downloading:', error);
+      Alert.alert('Error', 'Failed to download image. Please try again.');
+    } finally {
+      setIsDownloading(false);
+    }
+  };
+
+  const downloadWebImage = async () => {
+    try {
+      // Dynamically import html2canvas only on web
+      // @ts-ignore - html2canvas types may not be available
+      const html2canvas = (await import('html2canvas')).default;
+      
+      // Get the canvas element - in React Native Web, ref gives us the DOM node
+      const canvasElement = canvasRef.current;
+      if (!canvasElement) {
+        throw new Error('Canvas element not found');
+      }
+
+      // For React Native Web, we need to get the actual DOM element
+      // @ts-ignore - React Native Web ref structure
+      const domElement = canvasElement._nativeNode || canvasElement;
+      
+      // Use html2canvas to capture the view
+      const canvas = await html2canvas(domElement, {
+        width: canvasWidth,
+        height: canvasHeight,
+        useCORS: true,
+        scale: 2, // Higher quality
+        backgroundColor: null, // Transparent background
+      });
+
+      // Convert to blob and download
+      canvas.toBlob((blob) => {
+        if (blob) {
+          const url = URL.createObjectURL(blob);
+          const link = document.createElement('a');
+          link.href = url;
+          link.download = `chitrakal_${template.name}_${Date.now()}.png`;
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+          URL.revokeObjectURL(url);
+          Alert.alert('Success', 'Image downloaded successfully!');
+        } else {
+          Alert.alert('Error', 'Failed to create image file.');
+        }
+      }, 'image/png');
+    } catch (error) {
+      console.error('Error capturing image:', error);
+      Alert.alert('Error', 'Failed to capture image. Please try again.');
+      throw error;
+    }
+  };
+
+  const fetchPartyLogo = async () => {
+    try {
+      // Get user's political party from profile
+      const userProfile = state.user;
+      console.log('User profile:', userProfile);
+      console.log('Political party:', userProfile?.political_party);
+      
+      if (userProfile?.political_party) {
+        // Fetch all political parties to find the matching one
+        const response = await api.getPoliticalParties();
+        console.log('Political parties response:', response);
+        
+        if (response.success && response.data) {
+          const parties = Array.isArray(response.data) ? response.data : [];
+          console.log('Available parties:', parties);
+          
+          // Try exact match first, then case-insensitive match
+          const userParty = parties.find(
+            (party: any) => 
+              party.name === userProfile.political_party ||
+              party.name.toLowerCase() === userProfile.political_party?.toLowerCase()
+          );
+          
+          console.log('Found party:', userParty);
+          console.log('Party logo URL:', userParty?.logo_url);
+          
+          if (userParty) {
+            // If logo_url exists, use it; otherwise create a data URI placeholder
+            if (userParty.logo_url) {
+              setPartyLogo(userParty.logo_url);
+              setShowLogo(true); // Automatically show logo when available
+              console.log('Logo set successfully from database');
+            } else if (userParty.short_name) {
+              // Create a simple SVG placeholder logo with party color and initials
+              const color = userParty.color?.replace('#', '') || 'FF9933';
+              const svgContent = `<svg width="200" height="200" xmlns="http://www.w3.org/2000/svg">
+                <rect width="200" height="200" fill="#${color}"/>
+                <text x="50%" y="50%" font-family="Arial, sans-serif" font-size="72" font-weight="bold" 
+                      fill="white" text-anchor="middle" dominant-baseline="middle">${userParty.short_name}</text>
+              </svg>`;
+              // Encode SVG for data URI (URI encoding works better in React Native)
+              const encodedSvg = encodeURIComponent(svgContent);
+              const svgLogo = `data:image/svg+xml;charset=utf-8,${encodedSvg}`;
+              setPartyLogo(svgLogo);
+              setShowLogo(true); // Automatically show logo when available
+              console.log('Using SVG placeholder logo for:', userParty.short_name);
+            } else {
+              console.log('No logo URL or short_name found for party:', userParty?.name);
+            }
+          } else {
+            console.log('Party not found in list. User party:', userProfile.political_party);
+            console.log('Available parties:', parties.map((p: any) => p.name));
+          }
+        }
+      } else {
+        console.log('No political party in user profile');
+      }
+    } catch (error) {
+      console.error('Error fetching party logo:', error);
+    }
+  };
+
+  const fetchProfilePhoto = () => {
+    try {
+      const userProfile = state.user;
+      if (userProfile?.profile_photo_url) {
+        // Use the profile photo URL directly, handling both absolute URLs and relative paths
+        const photoUrl = userProfile.profile_photo_url.startsWith('http') 
+          ? userProfile.profile_photo_url 
+          : getFileUrl(userProfile.profile_photo_url);
+        setProfilePhoto(photoUrl);
+        console.log('Profile photo set:', photoUrl);
+      } else {
+        console.log('No profile photo URL in user profile');
+      }
+    } catch (error) {
+      console.error('Error fetching profile photo:', error);
+    }
+  };
+
+  const handleUndo = () => {
+    if (historyIndex > 0) {
+      setHistoryIndex(historyIndex - 1);
+      setTextElements(history[historyIndex - 1]);
+    }
+  };
+
+  const handleRedo = () => {
+    if (historyIndex < history.length - 1) {
+      setHistoryIndex(historyIndex + 1);
+      setTextElements(history[historyIndex + 1]);
+    }
+  };
+
+  const handleAddText = () => {
+    const newText: TextElement = {
+      id: Date.now().toString(),
+      text: '',
+      x: canvasWidth * 0.2,
+      y: canvasHeight * 0.4,
+      width: canvasWidth * 0.6,
+      height: 40,
+      fontSize: 24,
+      color: '#FFFFFF',
+      fontFamily: 'System',
+      textAlign: 'center',
+      textShadow: false,
+    };
+    const newElements = [...textElements, newText];
+    setTextElements(newElements);
+    setSelectedTextId(newText.id);
+    setShowTextProperties(true);
+    setActiveProperty(null);
+    // Add to history
+    const newHistory = history.slice(0, historyIndex + 1);
+    newHistory.push(newElements);
+    setHistory(newHistory);
+    setHistoryIndex(newHistory.length - 1);
+  };
+
+  const handleDeleteText = (id: string) => {
+    const newElements = textElements.filter(el => el.id !== id);
+    setTextElements(newElements);
+    if (selectedTextId === id) {
+      setSelectedTextId(null);
+    }
+    // Add to history
+    const newHistory = history.slice(0, historyIndex + 1);
+    newHistory.push(newElements);
+    setHistory(newHistory);
+    setHistoryIndex(newHistory.length - 1);
+  };
+
+  const updateTextElement = (id: string, updates: Partial<TextElement>) => {
+    setTextElements(prevElements => {
+      const newElements = prevElements.map(el => {
+        if (el.id === id) {
+          // Merge updates, ensuring text is never lost unless explicitly set to empty string
+          const mergedUpdates = { ...el, ...updates };
+          // Always preserve existing text if text is not explicitly provided in updates
+          if (updates.text === undefined) {
+            // Preserve the existing text from the element - never overwrite with empty
+            mergedUpdates.text = el.text || '';
+          } else if (updates.text === '' && el.text && el.text.trim().length > 0) {
+            // If explicitly setting to empty but element has text, preserve the existing text
+            // This prevents accidental text loss
+            mergedUpdates.text = el.text;
+          }
+          return mergedUpdates;
+        }
+        return el;
+      });
+      // Add to history
+      const newHistory = history.slice(0, historyIndex + 1);
+      newHistory.push(newElements);
+      setHistory(newHistory);
+      setHistoryIndex(newHistory.length - 1);
+      return newElements;
+    });
+  };
+
+  const selectedText = textElements.find(el => el.id === selectedTextId);
+
+  const fonts = ['System', 'Poppins', 'Inter', 'Roboto', 'Arial', 'Times New Roman'];
+  const colors = ['#FFFFFF', '#000000', '#881337', '#fbbf24', '#EF4444', '#10B981', '#3B82F6', '#8B5CF6'];
+  const alignments = ['left', 'center', 'right'];
+
+  return (
+    <View style={styles.container}>
+      {/* Header */}
+      <View style={styles.header}>
+        <TouchableOpacity onPress={onBack} style={styles.headerButton}>
+          <X size={24} color="#4B5563" />
+        </TouchableOpacity>
+        
+        <View style={styles.headerActions}>
+          <TouchableOpacity 
+            onPress={handleUndo}
+            disabled={historyIndex === 0}
+            style={[styles.headerButton, historyIndex === 0 && styles.headerButtonDisabled]}
+          >
+            <Undo2 size={20} color={historyIndex === 0 ? "#9CA3AF" : "#9CA3AF"} />
+          </TouchableOpacity>
+          <TouchableOpacity 
+            onPress={handleRedo}
+            disabled={historyIndex === history.length - 1}
+            style={[styles.headerButton, historyIndex === history.length - 1 && styles.headerButtonDisabled]}
+          >
+            <Redo2 size={20} color={historyIndex === history.length - 1 ? "#9CA3AF" : "#9CA3AF"} />
+          </TouchableOpacity>
+        </View>
+
+        <TouchableOpacity 
+          onPress={handleDownload} 
+          style={[styles.saveButton, isDownloading && styles.saveButtonDisabled]}
+          disabled={isDownloading}
+        >
+          <Text style={styles.saveButtonText}>{isDownloading ? 'Downloading...' : 'Download'}</Text>
+          <Download size={18} color={COLORS.white} />
+        </TouchableOpacity>
+      </View>
+
+      {/* Canvas Area */}
+      <ScrollView 
+        style={styles.canvasContainer}
+        contentContainerStyle={styles.canvasContent}
+        showsVerticalScrollIndicator={false}
+      >
+        <TouchableOpacity
+          activeOpacity={1}
+          onPress={() => {
+            setEditingTextId(null);
+            setSelectedTextId(null);
+            setShowTextProperties(false);
+            setActiveProperty(null);
+          }}
+          style={styles.canvasTouchable}
+        >
+          {Platform.OS === 'web' ? (
+            <View
+              ref={canvasRef as any}
+              style={[styles.canvas, { width: canvasWidth, height: canvasHeight }]}
+            >
+              {templateImageUrl ? (
+                <Image
+                  source={{ uri: templateImageUrl }}
+                  style={[styles.canvasImage, { width: canvasWidth, height: canvasHeight }]}
+                  resizeMode="cover"
+                  onLoad={handleImageLoad}
+                />
+              ) : (
+                <View style={[styles.placeholderCanvas, { width: canvasWidth, height: canvasHeight }]}>
+                  <Text style={styles.placeholderText}>No Image</Text>
+                </View>
+              )}
+
+              {/* Text Elements */}
+              {textElements.map((element) => {
+                const isSelected = element.id === selectedTextId;
+                return (
+                  <DraggableTextElement
+                    key={element.id}
+                    element={element}
+                    isSelected={isSelected}
+                    isEditing={editingTextId === element.id}
+                    onSelect={() => {
+                      setSelectedTextId(element.id);
+                      setShowTextProperties(true);
+                    }}
+                    onStartEdit={() => {
+                      setEditingTextId(element.id);
+                      setSelectedTextId(element.id);
+                      setShowTextProperties(true);
+                    }}
+                    onEndEdit={() => setEditingTextId(null)}
+                    onDelete={() => handleDeleteText(element.id)}
+                    onUpdate={(updates) => updateTextElement(element.id, updates)}
+                    canvasWidth={canvasWidth}
+                    canvasHeight={canvasHeight}
+                  />
+                );
+              })}
+
+              {/* Add Photo Button */}
+              {profilePhoto ? (
+                <View style={styles.addPhotoButton}>
+                  <Image
+                    source={{ uri: profilePhoto }}
+                    style={styles.profilePhotoImage}
+                    resizeMode="cover"
+                    onError={(error) => {
+                      const errorMessage = error?.nativeEvent?.error || String(error);
+                      console.error('Error loading profile photo:', errorMessage);
+                      console.error('Profile photo URI:', profilePhoto);
+                      console.warn('Possible causes:');
+                      console.warn('1. Image file is empty or corrupted (0 bytes)');
+                      console.warn('2. Network error or server not accessible');
+                      console.warn('3. File does not exist on the server');
+                      console.warn('4. CORS or permissions issue');
+                      setProfilePhoto(null);
+                    }}
+                  />
+                </View>
+              ) : (
+                <TouchableOpacity style={styles.addPhotoButton}>
+                  <ImageIcon size={32} color="rgba(255,255,255,0.9)" />
+                  <Text style={styles.addPhotoText}>Add Photo</Text>
+                </TouchableOpacity>
+              )}
+
+              {/* Add Logo Button */}
+              <TouchableOpacity 
+                style={[styles.addLogoButton, !partyLogo && styles.addLogoButtonDisabled]}
+                onPress={() => {
+                  if (partyLogo) {
+                    setShowLogo(!showLogo);
+                    console.log('Logo button clicked. Show logo:', !showLogo);
+                  } else {
+                    console.log('No party logo available. Party:', state.user?.political_party);
+                  }
+                }}
+              >
+                <Square size={24} color={partyLogo ? "rgba(255,255,255,0.9)" : "rgba(255,255,255,0.5)"} />
+                <Text style={[styles.addLogoText, !partyLogo && styles.addLogoTextDisabled]}>
+                  {partyLogo ? (showLogo ? 'Hide Logo' : 'Show Logo') : 'No Logo'}
+                </Text>
+              </TouchableOpacity>
+
+              {/* Political Party Logo */}
+              {showLogo && partyLogo && (
+                <View style={styles.logoContainer}>
+                  <Image
+                    source={{ uri: partyLogo }}
+                    style={styles.partyLogoImage}
+                    resizeMode="cover"
+                    onError={(error) => {
+                      const errorMessage = error?.nativeEvent?.error || String(error);
+                      console.error('Error loading logo image:', errorMessage, 'URI:', partyLogo);
+                      setShowLogo(false);
+                    }}
+                    onLoad={() => {
+                      console.log('Logo image loaded successfully');
+                    }}
+                  />
+                </View>
+              )}
+            </View>
+          ) : (
+            <ViewShot
+              ref={canvasRef}
+              options={{ format: 'png', quality: 1.0 }}
+              style={[styles.canvas, { width: canvasWidth, height: canvasHeight }]}
+            >
+              {templateImageUrl ? (
+                <Image
+                  source={{ uri: templateImageUrl }}
+                  style={[styles.canvasImage, { width: canvasWidth, height: canvasHeight }]}
+                  resizeMode="cover"
+                  onLoad={handleImageLoad}
+                />
+              ) : (
+                <View style={[styles.placeholderCanvas, { width: canvasWidth, height: canvasHeight }]}>
+                  <Text style={styles.placeholderText}>No Image</Text>
+                </View>
+              )}
+
+              {/* Text Elements */}
+              {textElements.map((element) => {
+                const isSelected = element.id === selectedTextId;
+                return (
+                  <DraggableTextElement
+                    key={element.id}
+                    element={element}
+                    isSelected={isSelected}
+                    isEditing={editingTextId === element.id}
+                    onSelect={() => {
+                      setSelectedTextId(element.id);
+                      setShowTextProperties(true);
+                    }}
+                    onStartEdit={() => {
+                      setEditingTextId(element.id);
+                      setSelectedTextId(element.id);
+                      setShowTextProperties(true);
+                    }}
+                    onEndEdit={() => setEditingTextId(null)}
+                    onDelete={() => handleDeleteText(element.id)}
+                    onUpdate={(updates) => updateTextElement(element.id, updates)}
+                    canvasWidth={canvasWidth}
+                    canvasHeight={canvasHeight}
+                  />
+                );
+              })}
+
+              {/* Add Photo Button */}
+              {profilePhoto ? (
+                <View style={styles.addPhotoButton}>
+                  <Image
+                    source={{ uri: profilePhoto }}
+                    style={styles.profilePhotoImage}
+                    resizeMode="cover"
+                    onError={(error) => {
+                      const errorMessage = error?.nativeEvent?.error || String(error);
+                      console.error('Error loading profile photo:', errorMessage);
+                      console.error('Profile photo URI:', profilePhoto);
+                      console.warn('Possible causes:');
+                      console.warn('1. Image file is empty or corrupted (0 bytes)');
+                      console.warn('2. Network error or server not accessible');
+                      console.warn('3. File does not exist on the server');
+                      console.warn('4. CORS or permissions issue');
+                      setProfilePhoto(null);
+                    }}
+                  />
+                </View>
+              ) : (
+                <TouchableOpacity style={styles.addPhotoButton}>
+                  <ImageIcon size={32} color="rgba(255,255,255,0.9)" />
+                  <Text style={styles.addPhotoText}>Add Photo</Text>
+                </TouchableOpacity>
+              )}
+
+              {/* Add Logo Button */}
+              <TouchableOpacity 
+                style={[styles.addLogoButton, !partyLogo && styles.addLogoButtonDisabled]}
+                onPress={() => {
+                  if (partyLogo) {
+                    setShowLogo(!showLogo);
+                    console.log('Logo button clicked. Show logo:', !showLogo);
+                  } else {
+                    console.log('No party logo available. Party:', state.user?.political_party);
+                  }
+                }}
+              >
+                <Square size={24} color={partyLogo ? "rgba(255,255,255,0.9)" : "rgba(255,255,255,0.5)"} />
+                <Text style={[styles.addLogoText, !partyLogo && styles.addLogoTextDisabled]}>
+                  {partyLogo ? (showLogo ? 'Hide Logo' : 'Show Logo') : 'No Logo'}
+                </Text>
+              </TouchableOpacity>
+
+              {/* Political Party Logo */}
+              {showLogo && partyLogo && (
+                <View style={styles.logoContainer}>
+                  <Image
+                    source={{ uri: partyLogo }}
+                    style={styles.partyLogoImage}
+                    resizeMode="cover"
+                    onError={(error) => {
+                      const errorMessage = error?.nativeEvent?.error || String(error);
+                      console.error('Error loading logo image:', errorMessage, 'URI:', partyLogo);
+                      setShowLogo(false);
+                    }}
+                    onLoad={() => {
+                      console.log('Logo image loaded successfully');
+                    }}
+                  />
+                </View>
+              )}
+            </ViewShot>
+          )}
+        </TouchableOpacity>
+      </ScrollView>
+
+      {/* Text Properties Panel */}
+      {showTextProperties && selectedText && (
+        <View style={styles.propertiesPanel}>
+          <View style={styles.propertiesHeader}>
+            <View style={styles.propertiesTitle}>
+              <Edit size={14} color="#6B7280" />
+              <Text style={styles.propertiesTitleText}>Text Properties</Text>
+            </View>
+            <TouchableOpacity onPress={() => {
+              // Ensure any text being edited is saved before closing
+              if (editingTextId && selectedText) {
+                // The text should already be saved via onChangeText, but ensure it's persisted
+                // Blur any active text input to trigger onBlur save
+                const activeElement = textElements.find(el => el.id === editingTextId);
+                if (activeElement) {
+                  // Text is already saved via onChangeText, just ensure edit mode ends
+                  setEditingTextId(null);
+                }
+              }
+              setShowTextProperties(false);
+              setActiveProperty(null);
+              setEditingTextId(null);
+              if (selectedTextId) {
+                setSelectedTextId(null);
+              }
+            }}>
+              <Text style={styles.doneButton}>Done</Text>
+            </TouchableOpacity>
+          </View>
+          
+          <ScrollView 
+            horizontal 
+            showsHorizontalScrollIndicator={false}
+            style={styles.propertiesScroll}
+            contentContainerStyle={styles.propertiesScrollContent}
+          >
+            <PropertyButton 
+              icon={<Type size={24} color={activeProperty === 'font' ? "#881337" : "#6B7280"} />} 
+              label="Font" 
+              active={activeProperty === 'font'}
+              onPress={() => setActiveProperty(activeProperty === 'font' ? null : 'font')}
+            />
+            <PropertyButton 
+              icon={<Palette size={24} color={activeProperty === 'color' ? "#881337" : "#6B7280"} />} 
+              label="Color"
+              active={activeProperty === 'color'}
+              onPress={() => setActiveProperty(activeProperty === 'color' ? null : 'color')}
+            />
+            <PropertyButton 
+              icon={<Text style={{ fontSize: 20, color: activeProperty === 'size' ? '#881337' : '#6B7280' }}>Aa</Text>} 
+              label="Size"
+              active={activeProperty === 'size'}
+              onPress={() => setActiveProperty(activeProperty === 'size' ? null : 'size')}
+            />
+            <PropertyButton 
+              icon={<Text style={{ fontSize: 20, color: activeProperty === 'shadow' ? '#881337' : '#6B7280' }}>T</Text>} 
+              label="Shadow"
+              active={activeProperty === 'shadow'}
+              onPress={() => setActiveProperty(activeProperty === 'shadow' ? null : 'shadow')}
+            />
+            <PropertyButton 
+              icon={<Text style={{ fontSize: 20, color: activeProperty === 'format' ? '#881337' : '#6B7280' }}>≡</Text>} 
+              label="Format"
+              active={activeProperty === 'format'}
+              onPress={() => setActiveProperty(activeProperty === 'format' ? null : 'format')}
+            />
+          </ScrollView>
+
+          {/* Property Options Panel */}
+          {activeProperty === 'font' && (
+            <View style={styles.propertyOptionsPanel}>
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.propertyOptionsScroll}>
+                {fonts.map((font) => (
+                  <TouchableOpacity
+                    key={font}
+                    style={[
+                      styles.fontOption,
+                      selectedText.fontFamily === font && styles.fontOptionActive
+                    ]}
+                    onPress={() => updateTextElement(selectedTextId!, { fontFamily: font })}
+                  >
+                    <Text style={[
+                      styles.fontOptionText,
+                      { fontFamily: font === 'System' ? undefined : font },
+                      selectedText.fontFamily === font && styles.fontOptionTextActive
+                    ]}>
+                      {font}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </ScrollView>
+            </View>
+          )}
+
+          {activeProperty === 'color' && (
+            <View style={styles.propertyOptionsPanel}>
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.propertyOptionsScroll}>
+                {colors.map((color) => (
+                  <TouchableOpacity
+                    key={color}
+                    style={[
+                      styles.colorOption,
+                      { backgroundColor: color },
+                      selectedText.color === color && styles.colorOptionActive
+                    ]}
+                    onPress={() => updateTextElement(selectedTextId!, { color })}
+                  />
+                ))}
+              </ScrollView>
+            </View>
+          )}
+
+          {activeProperty === 'size' && (
+            <View style={styles.propertyOptionsPanel}>
+              <View style={styles.sizeControl}>
+                <TouchableOpacity
+                  style={styles.sizeButton}
+                  onPress={() => {
+                    if (selectedText.fontSize > 12) {
+                      updateTextElement(selectedTextId!, { fontSize: selectedText.fontSize - 2 });
+                    }
+                  }}
+                >
+                  <Text style={styles.sizeButtonText}>-</Text>
+                </TouchableOpacity>
+                <Text style={styles.sizeValue}>{selectedText.fontSize}</Text>
+                <TouchableOpacity
+                  style={styles.sizeButton}
+                  onPress={() => {
+                    if (selectedText.fontSize < 72) {
+                      updateTextElement(selectedTextId!, { fontSize: selectedText.fontSize + 2 });
+                    }
+                  }}
+                >
+                  <Text style={styles.sizeButtonText}>+</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          )}
+
+          {activeProperty === 'shadow' && (
+            <View style={styles.propertyOptionsPanel}>
+              <View style={styles.shadowOptions}>
+                <TouchableOpacity
+                  style={[styles.shadowOption, !selectedText.textShadow && styles.shadowOptionActive]}
+                  onPress={() => updateTextElement(selectedTextId!, { textShadow: false })}
+                >
+                  <Text style={styles.shadowOptionText}>None</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.shadowOption, selectedText.textShadow === 'small' && styles.shadowOptionActive]}
+                  onPress={() => updateTextElement(selectedTextId!, { textShadow: 'small' })}
+                >
+                  <Text style={styles.shadowOptionText}>Small</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.shadowOption, selectedText.textShadow === 'medium' && styles.shadowOptionActive]}
+                  onPress={() => updateTextElement(selectedTextId!, { textShadow: 'medium' })}
+                >
+                  <Text style={styles.shadowOptionText}>Medium</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.shadowOption, selectedText.textShadow === 'large' && styles.shadowOptionActive]}
+                  onPress={() => updateTextElement(selectedTextId!, { textShadow: 'large' })}
+                >
+                  <Text style={styles.shadowOptionText}>Large</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          )}
+
+          {activeProperty === 'format' && (
+            <View style={styles.propertyOptionsPanel}>
+              <View style={styles.formatOptions}>
+                <TouchableOpacity
+                  style={[styles.formatOption, selectedText.textAlign === 'left' && styles.formatOptionActive]}
+                  onPress={() => updateTextElement(selectedTextId!, { textAlign: 'left' })}
+                >
+                  <Text style={styles.formatIcon}>☰</Text>
+                  <Text style={styles.formatLabel}>Left</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.formatOption, selectedText.textAlign === 'center' && styles.formatOptionActive]}
+                  onPress={() => updateTextElement(selectedTextId!, { textAlign: 'center' })}
+                >
+                  <Text style={styles.formatIcon}>☰</Text>
+                  <Text style={styles.formatLabel}>Center</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.formatOption, selectedText.textAlign === 'right' && styles.formatOptionActive]}
+                  onPress={() => updateTextElement(selectedTextId!, { textAlign: 'right' })}
+                >
+                  <Text style={styles.formatIcon}>☰</Text>
+                  <Text style={styles.formatLabel}>Right</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          )}
+        </View>
+      )}
+
+      {/* Bottom Actions */}
+      <View style={styles.bottomActions}>
+        <ActionButton 
+          icon={<Type size={26} color="#881337" />} 
+          label="Add Text" 
+          active 
+          onPress={handleAddText}
+        />
+        <ActionButton 
+          icon={<ImageIcon size={26} color="#6B7280" />} 
+          label="Add Image" 
+        />
+          <ActionButton 
+            icon={<Square size={26} color="#6B7280" />} 
+            label="Add Frame" 
+          />
+          <ActionButton 
+            icon={<Smile size={26} color="#6B7280" />} 
+            label="Stickers" 
+          />
+      </View>
+    </View>
+  );
+}
+
+// Draggable Text Element Component
+function DraggableTextElement({
+  element,
+  isSelected,
+  isEditing,
+  onSelect,
+  onStartEdit,
+  onEndEdit,
+  onDelete,
+  onUpdate,
+  canvasWidth,
+  canvasHeight,
+}: {
+  element: TextElement;
+  isSelected: boolean;
+  isEditing: boolean;
+  onSelect: () => void;
+  onStartEdit: () => void;
+  onEndEdit: () => void;
+  onDelete: () => void;
+  onUpdate: (updates: Partial<TextElement>) => void;
+  canvasWidth: number;
+  canvasHeight: number;
+}) {
+  const pan = useRef(new Animated.ValueXY({ x: element.x, y: element.y })).current;
+  const [localText, setLocalText] = useState(element.text);
+  const textInputRef = useRef<TextInput>(null);
+
+  // Use refs to store latest values so panResponder can access them
+  const elementRef = useRef(element);
+  const localTextRef = useRef(localText);
+  const isEditingRef = useRef(isEditing);
+
+  // Keep refs in sync with props/state
+  React.useEffect(() => {
+    elementRef.current = element;
+  }, [element]);
+
+  React.useEffect(() => {
+    localTextRef.current = localText;
+  }, [localText]);
+
+  React.useEffect(() => {
+    isEditingRef.current = isEditing;
+  }, [isEditing]);
+
+  // Sync pan value with element position when element changes (but not while dragging)
+  const isDraggingRef = useRef(false);
+  React.useEffect(() => {
+    if (!isDraggingRef.current && !isEditing) {
+      pan.setValue({ x: element.x, y: element.y });
+    }
+  }, [element.x, element.y, isEditing]);
+
+  const panResponder = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: (evt, gestureState) => {
+        // Don't start panning if we're editing text
+        if (isEditingRef.current) return false;
+        return true;
+      },
+      onMoveShouldSetPanResponder: (evt, gestureState) => {
+        // Don't start panning if we're editing text
+        if (isEditingRef.current) return false;
+        // Only start panning if there's significant movement
+        return Math.abs(gestureState.dx) > 5 || Math.abs(gestureState.dy) > 5;
+      },
+      onPanResponderGrant: () => {
+        // If we're still editing, save the text first
+        if (isEditingRef.current && textInputRef.current) {
+          // Save any unsaved text before starting drag - use refs to get latest values
+          const currentElement = elementRef.current;
+          const currentLocalText = localTextRef.current;
+          const textToSave = currentLocalText || currentElement.text || '';
+          onUpdate({ text: textToSave });
+          textInputRef.current.blur();
+        }
+        isDraggingRef.current = true;
+        onSelect();
+        pan.setOffset({
+          x: (pan.x as any)._value,
+          y: (pan.y as any)._value,
+        });
+      },
+      onPanResponderMove: Animated.event([null, { dx: pan.x, dy: pan.y }], {
+        useNativeDriver: false,
+      }),
+      onPanResponderRelease: () => {
+        isDraggingRef.current = false;
+        pan.flattenOffset();
+        const x = (pan.x as any)._value;
+        const y = (pan.y as any)._value;
+        // Get latest values from refs to ensure we have the current text
+        const currentElement = elementRef.current;
+        const currentLocalText = localTextRef.current;
+        // Get the text to preserve - prefer element text, fallback to local text
+        const textToPreserve = currentElement.text || currentLocalText;
+        // Only include text in update if we have a value, otherwise let updateTextElement preserve it
+        const updates: Partial<TextElement> = { 
+          x: Math.max(0, Math.min(x, canvasWidth - currentElement.width)), 
+          y: Math.max(0, Math.min(y, canvasHeight - currentElement.height))
+        };
+        // Only explicitly set text if we have a non-empty value
+        if (textToPreserve && textToPreserve.trim().length > 0) {
+          updates.text = textToPreserve;
+        }
+        onUpdate(updates);
+      },
+    })
+  ).current;
+
+  // Update local text when element text changes, but only if not currently editing
+  // This prevents overwriting user input while they're typing
+  React.useEffect(() => {
+    if (!isEditing) {
+      setLocalText(element.text);
+    }
+  }, [element.text, isEditing]);
+
+  return (
+    <Animated.View
+      style={[
+        styles.textElement,
+        {
+          left: pan.x,
+          top: pan.y,
+          width: element.width,
+          height: element.height,
+          backgroundColor: isEditing ? 'rgba(0, 0, 0, 0.2)' : 'transparent',
+          borderWidth: isEditing ? 2 : 0,
+          borderColor: isEditing ? '#fbbf24' : 'transparent',
+          borderRadius: isEditing ? 4 : 0,
+          padding: isEditing ? 8 : 0,
+        },
+      ]}
+      {...(!isEditing ? panResponder.panHandlers : {})}
+    >
+      {isEditing && (
+        <>
+          <TouchableOpacity 
+            style={styles.deleteButton}
+            onPress={onDelete}
+          >
+            <X size={12} color="#EF4444" />
+          </TouchableOpacity>
+          <View style={styles.resizeHandle} />
+        </>
+      )}
+      {isEditing ? (
+        <TextInput
+          ref={textInputRef}
+          style={[
+            styles.textElementInput,
+            {
+              fontSize: element.fontSize,
+              color: element.color,
+              fontFamily: element.fontFamily === 'System' ? undefined : element.fontFamily,
+              fontWeight: '700',
+              textAlign: element.textAlign || 'center',
+            },
+          ]}
+          value={localText}
+          onChangeText={(text) => {
+            setLocalText(text);
+            // Immediately save text to element state
+            onUpdate({ text });
+          }}
+          onBlur={() => {
+            // Ensure text is saved before ending edit
+            const textToSave = localText || element.text || '';
+            onUpdate({ text: textToSave });
+            setLocalText(textToSave);
+            onEndEdit();
+          }}
+          onSubmitEditing={() => {
+            // Also save on submit
+            const textToSave = localText || element.text || '';
+            onUpdate({ text: textToSave });
+            setLocalText(textToSave);
+            textInputRef.current?.blur();
+          }}
+          placeholder="Enter text"
+          placeholderTextColor="rgba(255, 255, 255, 0.5)"
+          multiline
+          autoFocus
+        />
+      ) : (
+        <TouchableOpacity
+          style={styles.textElementTouchable}
+          onPress={onStartEdit}
+          activeOpacity={0.8}
+        >
+          <Text
+            style={[
+              styles.textElementText,
+              {
+                fontSize: element.fontSize,
+                color: element.color,
+                fontFamily: element.fontFamily === 'System' ? undefined : element.fontFamily,
+                fontWeight: '700',
+                textAlign: element.textAlign || 'center',
+                textShadowColor: element.textShadow ? 'rgba(0, 0, 0, 0.5)' : 'transparent',
+                textShadowOffset: element.textShadow === 'small' ? { width: 0, height: 1 } :
+                                  element.textShadow === 'medium' ? { width: 0, height: 2 } :
+                                  element.textShadow === 'large' ? { width: 0, height: 3 } :
+                                  { width: 0, height: 0 },
+                textShadowRadius: element.textShadow === 'small' ? 2 :
+                                  element.textShadow === 'medium' ? 4 :
+                                  element.textShadow === 'large' ? 6 : 0,
+              },
+            ]}
+          >
+            {element.text || 'Tap to edit'}
+          </Text>
+        </TouchableOpacity>
+      )}
+    </Animated.View>
+  );
+}
+
+function PropertyButton({ 
+  icon, 
+  label, 
+  active = false,
+  onPress 
+}: { 
+  icon: React.ReactNode; 
+  label: string; 
+  active?: boolean;
+  onPress?: () => void;
+}) {
+  return (
+    <TouchableOpacity 
+      style={[styles.propertyButton, active && styles.propertyButtonActive]}
+      onPress={onPress}
+    >
+      <View style={[styles.propertyIcon, active && styles.propertyIconActive]}>
+        {icon}
+      </View>
+      <Text style={[styles.propertyLabel, active && styles.propertyLabelActive]}>
+        {label}
+      </Text>
+    </TouchableOpacity>
+  );
+}
+
+function ActionButton({ 
+  icon, 
+  label, 
+  active = false,
+  onPress 
+}: { 
+  icon: React.ReactNode; 
+  label: string; 
+  active?: boolean;
+  onPress?: () => void;
+}) {
+  return (
+    <TouchableOpacity 
+      style={styles.actionButton}
+      onPress={onPress}
+    >
+      <View style={[styles.actionIcon, active && styles.actionIconActive]}>
+        {icon}
+      </View>
+      <Text style={[styles.actionLabel, active && styles.actionLabelActive]}>
+        {label}
+      </Text>
+    </TouchableOpacity>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: '#F9FAFB',
+  },
+  header: {
+    backgroundColor: COLORS.white,
+    paddingTop: 48,
+    paddingBottom: 12,
+    paddingHorizontal: 16,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.05,
+    shadowRadius: 8,
+    elevation: 4,
+  },
+  headerButton: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  headerButtonDisabled: {
+    opacity: 0.3,
+  },
+  headerActions: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  saveButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: '#881337',
+    paddingHorizontal: 20,
+    paddingVertical: 8,
+    borderRadius: 20,
+    shadowColor: '#881337',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    elevation: 6,
+  },
+  saveButtonDisabled: {
+    opacity: 0.6,
+  },
+  saveButtonText: {
+    color: COLORS.white,
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  canvasContainer: {
+    flex: 1,
+  },
+  canvasContent: {
+    alignItems: 'center',
+    paddingVertical: 24,
+    paddingHorizontal: 0, // Remove horizontal padding to eliminate side white space
+  },
+  canvasTouchable: {
+    width: '100%',
+    alignItems: 'center',
+  },
+  canvas: {
+    backgroundColor: 'transparent', // Transparent to avoid white space showing
+    borderRadius: 16,
+    overflow: 'hidden',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 10 },
+    shadowOpacity: 0.2,
+    shadowRadius: 20,
+    elevation: 10,
+  },
+  canvasImage: {
+    width: '100%',
+    height: '100%',
+    backgroundColor: 'transparent',
+  },
+  placeholderCanvas: {
+    backgroundColor: '#E5E7EB',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  placeholderText: {
+    color: '#9CA3AF',
+    fontSize: 16,
+  },
+  textElement: {
+    position: 'absolute',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  textElementText: {
+    textAlign: 'center',
+    textShadowColor: 'rgba(0, 0, 0, 0.5)',
+    textShadowOffset: { width: 0, height: 2 },
+    textShadowRadius: 4,
+  },
+  textElementInput: {
+    width: '100%',
+    height: '100%',
+    textAlign: 'center',
+    backgroundColor: 'transparent',
+    padding: 0,
+    margin: 0,
+  },
+  textElementTouchable: {
+    width: '100%',
+    height: '100%',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  deleteButton: {
+    position: 'absolute',
+    top: -12,
+    left: -12,
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    backgroundColor: COLORS.white,
+    justifyContent: 'center',
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.2,
+    shadowRadius: 4,
+    elevation: 4,
+  },
+  resizeHandle: {
+    position: 'absolute',
+    bottom: -12,
+    right: -12,
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    backgroundColor: '#fbbf24',
+    borderWidth: 2,
+    borderColor: COLORS.white,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.3,
+    shadowRadius: 4,
+    elevation: 6,
+  },
+  addPhotoButton: {
+    position: 'absolute',
+    bottom: 24,
+    right: 24,
+    width: 96,
+    height: 96,
+    borderRadius: 48,
+    backgroundColor: 'rgba(0, 0, 0, 0.2)',
+    borderWidth: 2,
+    borderStyle: 'dashed',
+    borderColor: 'rgba(255, 255, 255, 0.6)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    gap: 4,
+    overflow: 'hidden',
+  },
+  addPhotoText: {
+    color: 'rgba(255, 255, 255, 0.9)',
+    fontSize: 9,
+    fontWeight: '500',
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+  },
+  profilePhotoImage: {
+    width: '100%',
+    height: '100%',
+    borderRadius: 46,
+    borderWidth: 2,
+    borderColor: 'rgba(255, 255, 255, 0.6)',
+  },
+  addLogoButton: {
+    position: 'absolute',
+    bottom: 24,
+    left: 24,
+    width: 64,
+    height: 64,
+    borderRadius: 8,
+    backgroundColor: 'rgba(0, 0, 0, 0.2)',
+    borderWidth: 2,
+    borderStyle: 'dashed',
+    borderColor: 'rgba(255, 255, 255, 0.6)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    gap: 4,
+  },
+  addLogoText: {
+    color: 'rgba(255, 255, 255, 0.9)',
+    fontSize: 8,
+    fontWeight: '500',
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+  },
+  addLogoButtonDisabled: {
+    opacity: 0.5,
+  },
+  addLogoTextDisabled: {
+    color: 'rgba(255, 255, 255, 0.5)',
+  },
+  propertiesPanel: {
+    backgroundColor: COLORS.white,
+    borderTopLeftRadius: 32,
+    borderTopRightRadius: 32,
+    paddingTop: 16,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: -4 },
+    shadowOpacity: 0.12,
+    shadowRadius: 30,
+    elevation: 10,
+  },
+  propertiesHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingHorizontal: 16,
+    paddingBottom: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: '#F3F4F6',
+  },
+  propertiesTitle: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+  },
+  propertiesTitleText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#6B7280',
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+  },
+  doneButton: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#881337',
+    backgroundColor: 'rgba(136, 19, 55, 0.1)',
+    paddingHorizontal: 12,
+    paddingVertical: 4,
+    borderRadius: 20,
+  },
+  propertiesScroll: {
+    paddingVertical: 8,
+  },
+  propertiesScrollContent: {
+    paddingHorizontal: 16,
+    gap: 16,
+  },
+  propertyButton: {
+    alignItems: 'center',
+    gap: 6,
+    minWidth: 60,
+  },
+  propertyButtonActive: {},
+  propertyIcon: {
+    width: 56,
+    height: 56,
+    borderRadius: 16,
+    backgroundColor: '#F9FAFB',
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  propertyIconActive: {
+    backgroundColor: COLORS.white,
+    borderWidth: 2,
+    borderColor: '#881337',
+    shadowColor: '#881337',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    elevation: 2,
+  },
+  propertyLabel: {
+    fontSize: 10,
+    color: '#6B7280',
+    fontWeight: '500',
+  },
+  propertyLabelActive: {
+    color: '#881337',
+    fontWeight: '600',
+  },
+  bottomActions: {
+    backgroundColor: COLORS.white,
+    flexDirection: 'row',
+    justifyContent: 'space-around',
+    paddingHorizontal: 24,
+    paddingVertical: 16,
+    borderTopWidth: 1,
+    borderTopColor: '#F3F4F6',
+  },
+  actionButton: {
+    alignItems: 'center',
+    gap: 6,
+    minWidth: 64,
+  },
+  actionIcon: {
+    width: 64,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: 'transparent',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  actionIconActive: {
+    backgroundColor: 'rgba(136, 19, 55, 0.1)',
+    borderWidth: 2,
+    borderColor: 'rgba(136, 19, 55, 0.2)',
+  },
+  actionLabel: {
+    fontSize: 11,
+    color: '#6B7280',
+    fontWeight: '500',
+  },
+  actionLabelActive: {
+    color: '#881337',
+    fontWeight: '600',
+  },
+  propertyOptionsPanel: {
+    backgroundColor: '#F9FAFB',
+    paddingVertical: 16,
+    paddingHorizontal: 16,
+    borderTopWidth: 1,
+    borderTopColor: '#E5E7EB',
+  },
+  propertyOptionsScroll: {
+    flexGrow: 0,
+  },
+  fontOption: {
+    paddingHorizontal: 20,
+    paddingVertical: 12,
+    marginRight: 12,
+    backgroundColor: COLORS.white,
+    borderRadius: 12,
+    borderWidth: 2,
+    borderColor: '#E5E7EB',
+    minWidth: 100,
+    alignItems: 'center',
+  },
+  fontOptionActive: {
+    borderColor: '#881337',
+    backgroundColor: 'rgba(136, 19, 55, 0.05)',
+  },
+  fontOptionText: {
+    fontSize: 16,
+    color: '#6B7280',
+    fontWeight: '500',
+  },
+  fontOptionTextActive: {
+    color: '#881337',
+    fontWeight: '700',
+  },
+  colorOption: {
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    marginRight: 12,
+    borderWidth: 3,
+    borderColor: 'transparent',
+  },
+  colorOptionActive: {
+    borderColor: '#881337',
+    transform: [{ scale: 1.1 }],
+  },
+  sizeControl: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 24,
+  },
+  sizeButton: {
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    backgroundColor: COLORS.white,
+    borderWidth: 2,
+    borderColor: '#881337',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  sizeButtonText: {
+    fontSize: 24,
+    color: '#881337',
+    fontWeight: '700',
+  },
+  sizeValue: {
+    fontSize: 24,
+    fontWeight: '700',
+    color: '#111827',
+    minWidth: 60,
+    textAlign: 'center',
+  },
+  shadowOptions: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+    gap: 12,
+  },
+  shadowOption: {
+    paddingHorizontal: 20,
+    paddingVertical: 12,
+    backgroundColor: COLORS.white,
+    borderRadius: 12,
+    borderWidth: 2,
+    borderColor: '#E5E7EB',
+    minWidth: 80,
+    alignItems: 'center',
+  },
+  shadowOptionActive: {
+    borderColor: '#881337',
+    backgroundColor: 'rgba(136, 19, 55, 0.05)',
+  },
+  shadowOptionText: {
+    fontSize: 14,
+    color: '#6B7280',
+    fontWeight: '500',
+  },
+  formatOptions: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+    gap: 12,
+  },
+  formatOption: {
+    paddingHorizontal: 24,
+    paddingVertical: 16,
+    backgroundColor: COLORS.white,
+    borderRadius: 12,
+    borderWidth: 2,
+    borderColor: '#E5E7EB',
+    alignItems: 'center',
+    gap: 8,
+    minWidth: 90,
+  },
+  formatOptionActive: {
+    borderColor: '#881337',
+    backgroundColor: 'rgba(136, 19, 55, 0.05)',
+  },
+  formatIcon: {
+    fontSize: 24,
+    color: '#6B7280',
+  },
+  formatLabel: {
+    fontSize: 12,
+    color: '#6B7280',
+    fontWeight: '500',
+  },
+  logoContainer: {
+    position: 'absolute',
+    bottom: 24,
+    left: 24,
+    width: 64,
+    height: 64,
+    backgroundColor: 'rgba(255, 255, 255, 0.95)',
+    borderRadius: 8,
+    padding: 8,
+    justifyContent: 'center',
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    elevation: 8,
+    zIndex: 10,
+    borderWidth: 2,
+    borderColor: 'rgba(136, 19, 55, 0.2)',
+  },
+  partyLogoImage: {
+    width: '100%',
+    height: '100%',
+  },
+});
+

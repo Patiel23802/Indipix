@@ -1,0 +1,47 @@
+# Root junk (not part of app source)
+*.zip
+__MACOSX/
+
+# Dependencies
+node_modules/
+
+# Env and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.p8
+*.p12
+*.key
+**/*firebase-adminsdk*.json
+**/*-adminsdk-*.json
+
+# Logs / OS
+.DS_Store
+*.log
+npm-debug.log*
+
+# --- Admin (Vite)
+Admin/dist/
+
+# --- Backend
+backend/uploads/
+
+# --- Frontend (Expo / React Native)
+.expo/
+expo-env.d.ts
+web-build/
+*.tsbuildinfo
+
+# Android build artifacts
+**/android/.gradle/
+**/android/**/build/
+**/android/app/.cxx/
+*.apk
+*.aab
+
+# iOS build artifacts & pods (reinstall with pod install)
+**/ios/Pods/
+**/ios/build/
+**/ios/**/*.xcuserstate
+**/ios/**/xcuserdata/

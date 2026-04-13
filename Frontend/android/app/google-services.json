@@ -1,0 +1,38 @@
+{
+  "project_info": {
+    "project_number": "291033423885",
+    "project_id": "chitrakalaweb1",
+    "storage_bucket": "chitrakalaweb1.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:291033423885:android:41949b074079e3c7b3b544",
+        "android_client_info": {
+          "package_name": "com.chitrakala.app"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "291033423885-ipfga51j121kdii0t3pr7jo41a5auq8l.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.chitrakala.app",
+            "certificate_hash": "5e8f16062ea3cd2c4a0d547876baa6f38cabf625"
+          }
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyD7bAqF2txt1lf4_mY_fh0atDf3eMGcmhw"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

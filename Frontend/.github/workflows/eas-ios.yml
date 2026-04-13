@@ -1,0 +1,38 @@
+# App Store–ready iOS build on EAS. Add repo secret EXPO_TOKEN from https://expo.dev/accounts/[account]/settings/access-tokens
+name: EAS iOS build (App Store)
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: EAS build profile (use production for App Store / TestFlight)
+        type: choice
+        options:
+          - production
+          - preview
+          - development
+        default: production
+
+jobs:
+  build:
+    name: EAS iOS
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Setup EAS
+        uses: expo/expo-github-action@v8
+        with:
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+
+      - name: Build iOS on EAS
+        run: eas build --platform ios --profile ${{ inputs.profile }} --non-interactive

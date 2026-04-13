@@ -1,0 +1,1074 @@
+import React, { useState, useEffect } from 'react';
+import {
+  View,
+  Text,
+  StyleSheet,
+  TextInput,
+  TouchableOpacity,
+  ScrollView,
+  ActivityIndicator,
+  Image,
+  Alert,
+  Platform,
+} from 'react-native';
+import { Camera, Phone, Mail, MapPin, Briefcase, Check, User } from 'lucide-react-native';
+import * as ImagePicker from 'expo-image-picker';
+import { COLORS } from '@/constants/colors';
+import { api } from '@/lib/api';
+import { useAuth } from '@/context/AuthContext';
+
+const TITLES = ['Mr.', 'Ms.', 'Mrs.', 'Dr.', 'Er.'];
+
+interface Location {
+  id: number;
+  name: string;
+  state_code?: string;
+  district_code?: string;
+}
+
+interface PoliticalParty {
+  id: number;
+  name: string;
+  short_name?: string;
+  logo_url?: string;
+  color?: string;
+}
+
+interface ProfileDetailsProps {
+  phone: string;
+  onContinue: (data: {
+    title: string;
+    first_name: string;
+    middle_name: string;
+    last_name: string;
+    alternate_phone: string;
+    email?: string;
+    state?: string;
+    district?: string;
+    tahsil?: string;
+    designation?: string;
+    political_party?: string;
+    profile_photo_url?: string;
+  }) => void;
+  loading: boolean;
+  error: string | null;
+  initialData?: {
+    title?: string | null;
+    first_name?: string | null;
+    middle_name?: string | null;
+    last_name?: string | null;
+    alternate_phone?: string | null;
+    email?: string | null;
+    state?: string | null;
+    district?: string | null;
+    tahsil?: string | null;
+    designation?: string | null;
+    political_party?: string | null;
+    profile_photo_url?: string | null;
+  };
+}
+
+export function ProfileDetails({ phone, onContinue, loading, error, initialData }: ProfileDetailsProps) {
+  const { state: authState } = useAuth();
+  const [title, setTitle] = useState(initialData?.title || 'Mr.');
+  const [firstName, setFirstName] = useState(initialData?.first_name || '');
+  const [middleName, setMiddleName] = useState(initialData?.middle_name || '');
+  const [lastName, setLastName] = useState(initialData?.last_name || '');
+  const [alternatePhone, setAlternatePhone] = useState(initialData?.alternate_phone || '');
+  const [email, setEmail] = useState(initialData?.email || '');
+  const [state, setState] = useState(initialData?.state || '');
+  const [stateId, setStateId] = useState<number | null>(null);
+  const [district, setDistrict] = useState(initialData?.district || '');
+  const [districtId, setDistrictId] = useState<number | null>(null);
+  const [tahsil, setTahsil] = useState(initialData?.tahsil || '');
+  const [designation, setDesignation] = useState(initialData?.designation || '');
+  const [politicalParty, setPoliticalParty] = useState(initialData?.political_party || '');
+  const [showTitleDropdown, setShowTitleDropdown] = useState(false);
+  const [showStateDropdown, setShowStateDropdown] = useState(false);
+  const [showDistrictDropdown, setShowDistrictDropdown] = useState(false);
+  const [showTahsilDropdown, setShowTahsilDropdown] = useState(false);
+  const [showPartyDropdown, setShowPartyDropdown] = useState(false);
+  
+  // Profile photo state
+  const [selectedPhoto, setSelectedPhoto] = useState<string | null>(null);
+  const [uploadingPhoto, setUploadingPhoto] = useState(false);
+  const [currentPhotoUrl, setCurrentPhotoUrl] = useState<string | null>(initialData?.profile_photo_url || null);
+
+  // Data from API
+  const [states, setStates] = useState<Location[]>([]);
+  const [districts, setDistricts] = useState<Location[]>([]);
+  const [tehsils, setTehsils] = useState<Location[]>([]);
+  const [politicalParties, setPoliticalParties] = useState<PoliticalParty[]>([]);
+  const [loadingStates, setLoadingStates] = useState(true);
+  const [loadingDistricts, setLoadingDistricts] = useState(false);
+  const [loadingTehsils, setLoadingTehsils] = useState(false);
+  const [loadingParties, setLoadingParties] = useState(true);
+
+  // Fetch states and political parties on mount
+  useEffect(() => {
+    fetchStates();
+    fetchPoliticalParties();
+  }, []);
+
+  // Fetch districts when state is selected
+  useEffect(() => {
+    if (stateId) {
+      fetchDistricts(stateId);
+      // Reset district and tahsil when state changes
+      setDistrict('');
+      setDistrictId(null);
+      setTahsil('');
+    } else {
+      setDistricts([]);
+      setTehsils([]);
+    }
+  }, [stateId]);
+
+  // Fetch tehsils when district is selected
+  useEffect(() => {
+    if (districtId) {
+      fetchTehsils(districtId);
+      // Reset tahsil when district changes
+      setTahsil('');
+    } else {
+      setTehsils([]);
+    }
+  }, [districtId]);
+
+  // Update form when initialData changes (for edit mode)
+  useEffect(() => {
+    if (initialData) {
+      if (initialData.title) setTitle(initialData.title);
+      if (initialData.first_name) setFirstName(initialData.first_name);
+      if (initialData.middle_name) setMiddleName(initialData.middle_name);
+      if (initialData.last_name) setLastName(initialData.last_name);
+      if (initialData.alternate_phone) setAlternatePhone(initialData.alternate_phone);
+      if (initialData.email) setEmail(initialData.email);
+      if (initialData.state) {
+        setState(initialData.state);
+        // Find state ID from states list
+        const foundState = states.find(s => s.name === initialData.state);
+        if (foundState) setStateId(foundState.id);
+      }
+      if (initialData.district) {
+        setDistrict(initialData.district);
+        // Find district ID from districts list
+        const foundDistrict = districts.find(d => d.name === initialData.district);
+        if (foundDistrict) setDistrictId(foundDistrict.id);
+      }
+      if (initialData.tahsil) setTahsil(initialData.tahsil);
+      if (initialData.designation) setDesignation(initialData.designation);
+      if (initialData.political_party) setPoliticalParty(initialData.political_party);
+    }
+  }, [initialData, states, districts]);
+
+  const fetchStates = async () => {
+    try {
+      setLoadingStates(true);
+      const response = await api.getStates();
+      if (response.success && response.data) {
+        setStates(Array.isArray(response.data) ? response.data : []);
+      }
+    } catch (error) {
+      console.error('Error fetching states:', error);
+      setStates([]);
+    } finally {
+      setLoadingStates(false);
+    }
+  };
+
+  const fetchDistricts = async (stateId: number) => {
+    try {
+      setLoadingDistricts(true);
+      const response = await api.getDistricts(stateId.toString());
+      if (response.success && response.data) {
+        setDistricts(Array.isArray(response.data) ? response.data : []);
+      }
+    } catch (error) {
+      console.error('Error fetching districts:', error);
+      setDistricts([]);
+    } finally {
+      setLoadingDistricts(false);
+    }
+  };
+
+  const fetchTehsils = async (districtId: number) => {
+    try {
+      setLoadingTehsils(true);
+      const response = await api.getTehsils(districtId.toString());
+      if (response.success && response.data) {
+        setTehsils(Array.isArray(response.data) ? response.data : []);
+      }
+    } catch (error) {
+      console.error('Error fetching tehsils:', error);
+      setTehsils([]);
+    } finally {
+      setLoadingTehsils(false);
+    }
+  };
+
+  const fetchPoliticalParties = async () => {
+    try {
+      setLoadingParties(true);
+      const response = await api.getPoliticalParties();
+      if (response.success && response.data) {
+        setPoliticalParties(Array.isArray(response.data) ? response.data : []);
+      }
+    } catch (error) {
+      console.error('Error fetching political parties:', error);
+      setPoliticalParties([]);
+    } finally {
+      setLoadingParties(false);
+    }
+  };
+
+  const isValid = firstName.trim() && lastName.trim();
+
+  // Update current photo URL when initialData changes
+  useEffect(() => {
+    if (initialData?.profile_photo_url) {
+      setCurrentPhotoUrl(initialData.profile_photo_url);
+    }
+  }, [initialData?.profile_photo_url]);
+
+  const formatPhone = (phone: string) => {
+    if (phone.length === 10) {
+      return `+91 ${phone.slice(0, 5)} ${phone.slice(5)}`;
+    }
+    return phone;
+  };
+
+  const getFileUrl = (url: string | null) => {
+    if (!url) return null;
+    if (url.startsWith('http')) return url;
+    // Extract base URL without /api suffix for static files (uploads)
+    const API_BASE_URL = process.env.EXPO_PUBLIC_API_URL || 'http://localhost:3000/api';
+    const baseUrl = API_BASE_URL.replace(/\/api$/, ''); // Remove /api suffix if present
+    return `${baseUrl}${url}`;
+  };
+
+  const pickImage = async () => {
+    try {
+      // Request permissions
+      const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (status !== 'granted') {
+        Alert.alert('Permission Required', 'We need access to your photos to set a profile picture.');
+        return;
+      }
+
+      // Launch image picker
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        allowsEditing: true,
+        aspect: [1, 1],
+        quality: 0.8,
+      });
+
+      if (!result.canceled && result.assets[0]) {
+        setSelectedPhoto(result.assets[0].uri);
+      }
+    } catch (error) {
+      console.error('Error picking image:', error);
+      Alert.alert('Error', 'Failed to pick image. Please try again.');
+    }
+  };
+
+  const handleContinue = async () => {
+    if (!isValid) return;
+
+    let profilePhotoUrl = currentPhotoUrl;
+
+    // Upload profile photo if a new one was selected
+    if (selectedPhoto && authState.user?.id) {
+      setUploadingPhoto(true);
+      try {
+        const uploadResult = await api.uploadProfilePhoto(authState.user.id, selectedPhoto);
+        console.log('Upload result:', uploadResult);
+        if (uploadResult.success) {
+          // Get profile_photo_url from response (check multiple possible locations)
+          const uploadedPhotoUrl = uploadResult.profile_photo_url || 
+                                   uploadResult.user?.profile_photo_url ||
+                                   null;
+          
+          if (uploadedPhotoUrl) {
+            profilePhotoUrl = uploadedPhotoUrl;
+            setCurrentPhotoUrl(profilePhotoUrl);
+            // Clear selected photo after successful upload
+            setSelectedPhoto(null);
+            console.log('Profile photo uploaded successfully:', profilePhotoUrl);
+          } else {
+            console.warn('Upload succeeded but no profile_photo_url in response');
+            // Still continue - the upload endpoint should have saved it to DB
+          }
+        } else {
+          Alert.alert('Upload Failed', uploadResult.error || 'Failed to upload profile photo. Please try again.');
+          setUploadingPhoto(false);
+          return;
+        }
+      } catch (error) {
+        console.error('Error uploading photo:', error);
+        Alert.alert('Upload Failed', 'Failed to upload profile photo. Please try again.');
+        setUploadingPhoto(false);
+        return;
+      } finally {
+        setUploadingPhoto(false);
+      }
+    }
+
+    // Build profile data object
+    const profileData: any = {
+      title,
+      first_name: firstName,
+      middle_name: middleName,
+      last_name: lastName,
+      alternate_phone: alternatePhone,
+      email: email || undefined,
+      state: state || undefined,
+      district: district || undefined,
+      tahsil: tahsil || undefined,
+      designation: designation || undefined,
+      political_party: politicalParty || undefined,
+    };
+
+    // Only include profile_photo_url if we have a value (either from upload or existing)
+    if (profilePhotoUrl) {
+      profileData.profile_photo_url = profilePhotoUrl;
+    }
+
+    console.log('Saving profile with data:', { ...profileData, profile_photo_url: profileData.profile_photo_url ? 'present' : 'missing' });
+
+    // Continue with profile update
+    onContinue(profileData);
+  };
+
+  return (
+    <View style={styles.container}>
+      <ScrollView style={styles.scrollView} showsVerticalScrollIndicator={false}>
+        <View style={styles.header}>
+          <Text style={styles.title}>Profile Details</Text>
+          <Text style={styles.subtitle}>
+            Complete your profile to customize your posters and banners.
+          </Text>
+        </View>
+
+        {error && (
+          <View style={styles.errorContainer}>
+            <Text style={styles.errorText}>{error}</Text>
+          </View>
+        )}
+
+        {/* Profile Photo Section */}
+        <View style={styles.profilePhotoSection}>
+          <View style={styles.profilePhotoContainer}>
+            <View style={styles.profilePhoto}>
+              {selectedPhoto ? (
+                <Image
+                  source={{ uri: selectedPhoto }}
+                  style={styles.profileImage}
+                />
+              ) : currentPhotoUrl ? (
+                <Image
+                  source={{ uri: getFileUrl(currentPhotoUrl) || currentPhotoUrl }}
+                  style={styles.profileImage}
+                  onError={() => setCurrentPhotoUrl(null)}
+                />
+              ) : (
+                <View style={styles.profilePlaceholder}>
+                  <User size={48} color={COLORS.gray} />
+                </View>
+              )}
+            </View>
+            <TouchableOpacity 
+              style={styles.changePhotoButton}
+              onPress={pickImage}
+              disabled={loading || uploadingPhoto}
+            >
+              {uploadingPhoto ? (
+                <ActivityIndicator size="small" color={COLORS.white} />
+              ) : (
+                <Camera size={18} color={COLORS.white} />
+              )}
+            </TouchableOpacity>
+          </View>
+          <TouchableOpacity onPress={pickImage} disabled={loading || uploadingPhoto}>
+            <Text style={styles.changePhotoText}>
+              {uploadingPhoto ? 'Uploading...' : selectedPhoto ? 'Photo Selected' : 'Change Photo'}
+            </Text>
+          </TouchableOpacity>
+        </View>
+
+        {/* Name Fields */}
+        <View style={styles.section}>
+          <View style={styles.rowContainer}>
+            <View style={[styles.fieldGroup, styles.titleField]}>
+              <Text style={styles.label}>Title</Text>
+              <TouchableOpacity
+                style={styles.selectWrapper}
+                onPress={() => {
+                  setShowTitleDropdown(!showTitleDropdown);
+                  setShowStateDropdown(false);
+                  setShowDistrictDropdown(false);
+                  setShowTahsilDropdown(false);
+                  setShowPartyDropdown(false);
+                }}
+                disabled={loading}
+              >
+                <Text style={styles.selectValue}>{title}</Text>
+                <Text style={styles.selectArrow}>▼</Text>
+              </TouchableOpacity>
+              {showTitleDropdown && (
+                <View style={styles.dropdown}>
+                  {TITLES.map(t => (
+                    <TouchableOpacity
+                      key={t}
+                      style={styles.dropdownItem}
+                      onPress={() => {
+                        setTitle(t);
+                        setShowTitleDropdown(false);
+                      }}
+                    >
+                      <Text
+                        style={[
+                          styles.dropdownItemText,
+                          t === title && styles.dropdownItemTextActive,
+                        ]}
+                      >
+                        {t}
+                      </Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+              )}
+            </View>
+
+            <View style={[styles.fieldGroup, styles.firstNameField]}>
+              <Text style={styles.label}>First Name</Text>
+              <View style={styles.inputWrapper}>
+                <TextInput
+                  style={styles.input}
+                  placeholder="Amit"
+                  placeholderTextColor={COLORS.gray}
+                  value={firstName}
+                  onChangeText={setFirstName}
+                  editable={!loading}
+                />
+              </View>
+            </View>
+          </View>
+
+          <View style={styles.rowContainer}>
+            <View style={[styles.fieldGroup, styles.flex1]}>
+              <Text style={styles.label}>Middle Name</Text>
+              <View style={styles.inputWrapper}>
+                <TextInput
+                  style={styles.input}
+                  placeholder="Kumar"
+                  placeholderTextColor={COLORS.gray}
+                  value={middleName}
+                  onChangeText={setMiddleName}
+                  editable={!loading}
+                />
+              </View>
+            </View>
+
+            <View style={[styles.fieldGroup, styles.flex1]}>
+              <Text style={styles.label}>Surname</Text>
+              <View style={styles.inputWrapper}>
+                <TextInput
+                  style={styles.input}
+                  placeholder="Sharma"
+                  placeholderTextColor={COLORS.gray}
+                  value={lastName}
+                  onChangeText={setLastName}
+                  editable={!loading}
+                />
+              </View>
+            </View>
+          </View>
+        </View>
+
+        <View style={styles.divider} />
+
+        {/* Contact Fields */}
+        <View style={styles.section}>
+          <View style={styles.fieldGroup}>
+            <Text style={styles.label}>Phone Number</Text>
+            <View style={[styles.inputWrapper, styles.disabledInput]}>
+              <Phone size={20} color={COLORS.gray} style={styles.inputIcon} />
+              <TextInput
+                style={styles.input}
+                value={formatPhone(phone)}
+                editable={false}
+              />
+            </View>
+          </View>
+
+          <View style={styles.fieldGroup}>
+            <Text style={styles.label}>Alternate Phone</Text>
+            <View style={styles.inputWrapper}>
+              <Phone size={20} color={COLORS.gray} style={styles.inputIcon} />
+              <TextInput
+                style={styles.input}
+                placeholder="Optional"
+                placeholderTextColor={COLORS.gray}
+                value={alternatePhone}
+                onChangeText={setAlternatePhone}
+                keyboardType="phone-pad"
+                editable={!loading}
+              />
+            </View>
+          </View>
+
+          <View style={styles.fieldGroup}>
+            <Text style={styles.label}>Email Address</Text>
+            <View style={styles.inputWrapper}>
+              <Mail size={20} color={COLORS.gray} style={styles.inputIcon} />
+              <TextInput
+                style={styles.input}
+                placeholder="name@example.com"
+                placeholderTextColor={COLORS.gray}
+                value={email}
+                onChangeText={setEmail}
+                keyboardType="email-address"
+                autoCapitalize="none"
+                editable={!loading}
+              />
+            </View>
+          </View>
+        </View>
+
+        <View style={styles.divider} />
+
+        {/* Location Details */}
+        <View style={styles.section}>
+          <View style={styles.sectionHeader}>
+            <MapPin size={18} color={COLORS.primary} />
+            <Text style={styles.sectionTitle}>Location Details</Text>
+          </View>
+
+          <View style={styles.fieldGroup}>
+            <Text style={styles.label}>State</Text>
+            <TouchableOpacity
+              style={styles.selectWrapper}
+              onPress={() => {
+                setShowStateDropdown(!showStateDropdown);
+                setShowTitleDropdown(false);
+                setShowDistrictDropdown(false);
+                setShowTahsilDropdown(false);
+                setShowPartyDropdown(false);
+              }}
+              disabled={loading}
+            >
+              <Text style={[styles.selectValue, !state && styles.placeholder]}>
+                {state || 'Select State'}
+              </Text>
+              <Text style={styles.selectArrow}>▼</Text>
+            </TouchableOpacity>
+            {showStateDropdown && (
+              <View style={styles.dropdown}>
+                {loadingStates ? (
+                  <View style={styles.loadingContainer}>
+                    <ActivityIndicator size="small" color={COLORS.primary} />
+                  </View>
+                ) : states.length === 0 ? (
+                  <Text style={styles.emptyText}>No states available</Text>
+                ) : (
+                  states.map(s => (
+                    <TouchableOpacity
+                      key={s.id}
+                      style={styles.dropdownItem}
+                      onPress={() => {
+                        setState(s.name);
+                        setStateId(s.id);
+                        setShowStateDropdown(false);
+                      }}
+                    >
+                      <Text
+                        style={[
+                          styles.dropdownItemText,
+                          s.name === state && styles.dropdownItemTextActive,
+                        ]}
+                      >
+                        {s.name}
+                      </Text>
+                    </TouchableOpacity>
+                  ))
+                )}
+              </View>
+            )}
+          </View>
+
+          <View style={styles.rowContainer}>
+            <View style={[styles.fieldGroup, styles.flex1]}>
+              <Text style={styles.label}>District</Text>
+              <TouchableOpacity
+                style={styles.selectWrapper}
+                onPress={() => {
+                  setShowDistrictDropdown(!showDistrictDropdown);
+                  setShowTitleDropdown(false);
+                  setShowStateDropdown(false);
+                  setShowTahsilDropdown(false);
+                  setShowPartyDropdown(false);
+                }}
+                disabled={loading || !stateId}
+              >
+                <Text style={[styles.selectValue, !district && styles.placeholder]}>
+                  {district || 'District'}
+                </Text>
+                <Text style={styles.selectArrow}>▼</Text>
+              </TouchableOpacity>
+              {showDistrictDropdown && (
+                <View style={styles.dropdown}>
+                  {loadingDistricts ? (
+                    <View style={styles.loadingContainer}>
+                      <ActivityIndicator size="small" color={COLORS.primary} />
+                    </View>
+                  ) : districts.length === 0 ? (
+                    <Text style={styles.emptyText}>
+                      {stateId ? 'No districts available' : 'Please select a state first'}
+                    </Text>
+                  ) : (
+                    districts.map(d => (
+                      <TouchableOpacity
+                        key={d.id}
+                        style={styles.dropdownItem}
+                        onPress={() => {
+                          setDistrict(d.name);
+                          setDistrictId(d.id);
+                          setShowDistrictDropdown(false);
+                        }}
+                      >
+                        <Text
+                          style={[
+                            styles.dropdownItemText,
+                            d.name === district && styles.dropdownItemTextActive,
+                          ]}
+                        >
+                          {d.name}
+                        </Text>
+                      </TouchableOpacity>
+                    ))
+                  )}
+                </View>
+              )}
+            </View>
+
+            <View style={[styles.fieldGroup, styles.flex1]}>
+              <Text style={styles.label}>Tahsil</Text>
+              <TouchableOpacity
+                style={styles.selectWrapper}
+                onPress={() => {
+                  setShowTahsilDropdown(!showTahsilDropdown);
+                  setShowTitleDropdown(false);
+                  setShowStateDropdown(false);
+                  setShowDistrictDropdown(false);
+                  setShowPartyDropdown(false);
+                }}
+                disabled={loading || !districtId}
+              >
+                <Text style={[styles.selectValue, !tahsil && styles.placeholder]}>
+                  {tahsil || 'Tahsil'}
+                </Text>
+                <Text style={styles.selectArrow}>▼</Text>
+              </TouchableOpacity>
+              {showTahsilDropdown && (
+                <View style={styles.dropdown}>
+                  {loadingTehsils ? (
+                    <View style={styles.loadingContainer}>
+                      <ActivityIndicator size="small" color={COLORS.primary} />
+                    </View>
+                  ) : tehsils.length === 0 ? (
+                    <Text style={styles.emptyText}>
+                      {districtId ? 'No tehsils available' : 'Please select a district first'}
+                    </Text>
+                  ) : (
+                    tehsils.map(t => (
+                      <TouchableOpacity
+                        key={t.id}
+                        style={styles.dropdownItem}
+                        onPress={() => {
+                          setTahsil(t.name);
+                          setShowTahsilDropdown(false);
+                        }}
+                      >
+                        <Text
+                          style={[
+                            styles.dropdownItemText,
+                            t.name === tahsil && styles.dropdownItemTextActive,
+                          ]}
+                        >
+                          {t.name}
+                        </Text>
+                      </TouchableOpacity>
+                    ))
+                  )}
+                </View>
+              )}
+            </View>
+          </View>
+        </View>
+
+        <View style={styles.divider} />
+
+        {/* Professional Section */}
+        <View style={styles.section}>
+          <View style={styles.sectionHeader}>
+            <Briefcase size={18} color={COLORS.primary} />
+            <Text style={styles.sectionTitle}>Professional</Text>
+          </View>
+
+          <View style={styles.fieldGroup}>
+            <Text style={styles.label}>Designation</Text>
+            <View style={styles.inputWrapper}>
+              <TextInput
+                style={styles.input}
+                placeholder="e.g. District President"
+                placeholderTextColor={COLORS.gray}
+                value={designation}
+                onChangeText={setDesignation}
+                editable={!loading}
+              />
+            </View>
+          </View>
+
+          <View style={styles.fieldGroup}>
+            <Text style={styles.label}>Political Party</Text>
+            <TouchableOpacity
+              style={styles.selectWrapper}
+              onPress={() => {
+                setShowPartyDropdown(!showPartyDropdown);
+                setShowTitleDropdown(false);
+                setShowStateDropdown(false);
+                setShowDistrictDropdown(false);
+                setShowTahsilDropdown(false);
+              }}
+              disabled={loading}
+            >
+              <Text style={[styles.selectValue, !politicalParty && styles.placeholder]}>
+                {politicalParty || 'Select Party'}
+              </Text>
+              <Text style={styles.selectArrow}>▼</Text>
+            </TouchableOpacity>
+            {showPartyDropdown && (
+              <View style={styles.dropdown}>
+                {loadingParties ? (
+                  <View style={styles.loadingContainer}>
+                    <ActivityIndicator size="small" color={COLORS.primary} />
+                  </View>
+                ) : politicalParties.length === 0 ? (
+                  <Text style={styles.emptyText}>No political parties available</Text>
+                ) : (
+                  politicalParties.map(party => (
+                    <TouchableOpacity
+                      key={party.id}
+                      style={styles.dropdownItem}
+                      onPress={() => {
+                        setPoliticalParty(party.name);
+                        setShowPartyDropdown(false);
+                      }}
+                    >
+                      <View style={styles.partyItem}>
+                        {party.logo_url && (
+                          <Image
+                            source={{ uri: party.logo_url }}
+                            style={styles.partyLogo}
+                          />
+                        )}
+                        <Text
+                          style={[
+                            styles.dropdownItemText,
+                            party.name === politicalParty && styles.dropdownItemTextActive,
+                          ]}
+                        >
+                          {party.short_name ? `${party.name} (${party.short_name})` : party.name}
+                        </Text>
+                      </View>
+                    </TouchableOpacity>
+                  ))
+                )}
+              </View>
+            )}
+          </View>
+        </View>
+
+        <View style={styles.spacer} />
+      </ScrollView>
+
+      {/* Fixed Footer with Save Button */}
+      <View style={styles.footer}>
+        <TouchableOpacity
+          style={[styles.saveButton, (!isValid || uploadingPhoto) && styles.saveButtonDisabled]}
+          onPress={handleContinue}
+          disabled={!isValid || loading || uploadingPhoto}
+        >
+          {(loading || uploadingPhoto) ? (
+            <ActivityIndicator color={COLORS.white} />
+          ) : (
+            <>
+              <Text style={styles.saveButtonText}>Save Profile</Text>
+              <Check size={20} color={COLORS.white} style={styles.checkIcon} />
+            </>
+          )}
+        </TouchableOpacity>
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: COLORS.backgroundDark,
+  },
+  scrollView: {
+    flex: 1,
+    paddingHorizontal: 24,
+    paddingTop: 24,
+  },
+  header: {
+    marginBottom: 16,
+  },
+  title: {
+    fontSize: 28,
+    fontWeight: '700',
+    color: COLORS.white,
+    marginBottom: 8,
+    letterSpacing: -0.5,
+  },
+  subtitle: {
+    fontSize: 14,
+    color: COLORS.grayLight,
+    lineHeight: 20,
+  },
+  errorContainer: {
+    backgroundColor: 'rgba(236, 19, 73, 0.1)',
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 24,
+    borderLeftWidth: 4,
+    borderLeftColor: COLORS.primary,
+  },
+  errorText: {
+    color: '#ff6b6b',
+    fontSize: 14,
+    fontWeight: '500',
+  },
+  profilePhotoSection: {
+    alignItems: 'center',
+    marginBottom: 20,
+    paddingBottom: 8,
+  },
+  profilePhotoContainer: {
+    position: 'relative',
+    marginBottom: 12,
+  },
+  profilePhoto: {
+    width: 112,
+    height: 112,
+    borderRadius: 56,
+    backgroundColor: COLORS.white,
+    borderWidth: 4,
+    borderColor: COLORS.white,
+    overflow: 'hidden',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  profileImage: {
+    width: '100%',
+    height: '100%',
+  },
+  profilePlaceholder: {
+    width: '100%',
+    height: '100%',
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: COLORS.surfaceDark,
+  },
+  changePhotoButton: {
+    position: 'absolute',
+    bottom: 4,
+    right: 4,
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: COLORS.primary,
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderWidth: 3,
+    borderColor: COLORS.backgroundDark,
+  },
+  changePhotoText: {
+    color: COLORS.primary,
+    fontSize: 14,
+    fontWeight: '600',
+    marginTop: 8,
+  },
+  section: {
+    marginBottom: 16,
+  },
+  sectionHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginBottom: 16,
+  },
+  sectionTitle: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: COLORS.primary,
+  },
+  rowContainer: {
+    flexDirection: 'row',
+    gap: 12,
+    marginBottom: 16,
+  },
+  fieldGroup: {
+    marginBottom: 16,
+  },
+  titleField: {
+    width: '30%',
+  },
+  firstNameField: {
+    flex: 1,
+  },
+  flex1: {
+    flex: 1,
+  },
+  label: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: COLORS.grayMedium,
+    marginBottom: 6,
+    marginLeft: 4,
+  },
+  inputWrapper: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.05)',
+    borderRadius: 24,
+    paddingHorizontal: 16,
+    height: 48,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.1)',
+  },
+  disabledInput: {
+    opacity: 0.6,
+  },
+  inputIcon: {
+    marginRight: 12,
+  },
+  input: {
+    flex: 1,
+    color: COLORS.white,
+    fontSize: 14,
+    fontWeight: '500',
+  },
+  selectWrapper: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.05)',
+    borderRadius: 24,
+    paddingHorizontal: 16,
+    height: 48,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.1)',
+  },
+  selectValue: {
+    color: COLORS.white,
+    fontSize: 14,
+    fontWeight: '500',
+  },
+  placeholder: {
+    color: COLORS.gray,
+  },
+  selectArrow: {
+    color: COLORS.gray,
+    fontSize: 12,
+  },
+  dropdown: {
+    backgroundColor: 'rgba(47, 27, 32, 0.95)',
+    borderRadius: 12,
+    marginTop: 8,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.1)',
+    overflow: 'hidden',
+    maxHeight: 200,
+  },
+  dropdownItem: {
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255, 255, 255, 0.05)',
+  },
+  dropdownItemText: {
+    color: COLORS.grayLight,
+    fontSize: 14,
+  },
+  dropdownItemTextActive: {
+    color: COLORS.primary,
+    fontWeight: '600',
+  },
+  divider: {
+    height: 1,
+    backgroundColor: 'rgba(255, 255, 255, 0.1)',
+    marginVertical: 8,
+  },
+  spacer: {
+    height: 16,
+  },
+  footer: {
+    paddingHorizontal: 24,
+    paddingTop: 16,
+    paddingBottom: 32,
+    backgroundColor: COLORS.backgroundDark,
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(255, 255, 255, 0.05)',
+  },
+  saveButton: {
+    backgroundColor: COLORS.primary,
+    borderRadius: 9999,
+    paddingVertical: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexDirection: 'row',
+    shadowColor: COLORS.primary,
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.25,
+    shadowRadius: 10,
+    elevation: 8,
+  },
+  saveButtonDisabled: {
+    opacity: 0.5,
+  },
+  saveButtonText: {
+    color: COLORS.white,
+    fontSize: 18,
+    fontWeight: '700',
+    letterSpacing: 0.5,
+  },
+  checkIcon: {
+    marginLeft: 8,
+  },
+  loadingContainer: {
+    padding: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  emptyText: {
+    color: COLORS.gray,
+    fontSize: 14,
+    padding: 16,
+    textAlign: 'center',
+  },
+  partyItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  partyLogo: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+  },
+});
