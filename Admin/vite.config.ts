@@ -7,7 +7,18 @@ export default defineConfig({
   base: '/',
   server: {
     port: 3001,
-    open: true
+    open: true,
+  },
+  preview: {
+    host: '127.0.0.1',
+    port: 3001,
+    allowedHosts: [
+      'dashboard.indipix.in',
+      'www.dashboard.indipix.in',
+      '64.227.150.214',
+      'localhost',
+      '127.0.0.1',
+    ],
   },
   build: {
     outDir: 'dist',

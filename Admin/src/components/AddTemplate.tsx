@@ -27,6 +27,7 @@ const AddTemplate: React.FC = () => {
     description: '',
     format: 'png',
     size: '1:1',
+    publishAt: '',
   });
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [filePreview, setFilePreview] = useState<string | null>(null);
@@ -79,6 +80,14 @@ const AddTemplate: React.FC = () => {
     }
   };
 
+  const toIsoFromDatetimeLocal = (value: string): string | null => {
+    const s = value.trim();
+    if (!s) return null;
+    const d = new Date(s);
+    if (Number.isNaN(d.getTime())) return null;
+    return d.toISOString();
+  };
+
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
@@ -114,6 +123,12 @@ const AddTemplate: React.FC = () => {
       setIsSubmitting(true);
       setUploadProgress(0);
 
+      const publishAtIso = toIsoFromDatetimeLocal(formData.publishAt);
+      if (formData.publishAt.trim() && !publishAtIso) {
+        alert('Please pick a valid publish date/time.');
+        return;
+      }
+
       const formDataToSend = new FormData();
       formDataToSend.append('file', selectedFile);
       formDataToSend.append('name', formData.templateName);
@@ -121,6 +136,9 @@ const AddTemplate: React.FC = () => {
       formDataToSend.append('description', formData.description);
       formDataToSend.append('file_format', formData.format);
       formDataToSend.append('aspect_ratio', formData.size);
+      if (publishAtIso) {
+        formDataToSend.append('publish_at', publishAtIso);
+      }
 
       const data = await api.createTemplate(formDataToSend);
 
@@ -318,6 +336,24 @@ const AddTemplate: React.FC = () => {
                       value={formData.description}
                       onChange={handleInputChange}
                     ></textarea>
+                  </div>
+
+                  <div className="flex flex-col gap-2">
+                    <label className="text-sm font-medium text-gray-700 dark:text-gray-300" htmlFor="publishAt">
+                      Schedule publish <span className="text-gray-400 font-normal">(Optional)</span>
+                    </label>
+                    <input
+                      className="w-full rounded-lg border-gray-300 bg-white dark:bg-[#11161d] dark:border-[#29303b] text-gray-900 dark:text-white shadow-sm focus:border-primary focus:ring-primary text-sm p-2.5"
+                      id="publishAt"
+                      name="publishAt"
+                      placeholder="YYYY-MM-DDThh:mm"
+                      type="datetime-local"
+                      value={formData.publishAt}
+                      onChange={handleInputChange}
+                    />
+                    <p className="text-xs text-gray-500 dark:text-gray-400">
+                      Leave blank to keep the template as Draft. Time is in your browser’s local timezone.
+                    </p>
                   </div>
                 </div>
 

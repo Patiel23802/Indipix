@@ -1,71 +1,5 @@
-require('dotenv').config();
-
-const crypto = require('crypto');
-const isProduction = process.env.NODE_ENV === 'production';
-
-function normalizePhoneTo10Digits(input) {
-  if (!input) return '';
-  const digits = String(input).replace(/\D/g, '');
-  return digits.length >= 10 ? digits.slice(-10) : digits;
-}
-
-function resolveOtpProvider() {
-  const env = (process.env.OTP_PROVIDER || '').toLowerCase().trim();
-  if (env === 'sms' || env === 'firebase' || env === 'dev') return env;
-  return isProduction ? 'firebase' : 'dev';
-}
-
-const OTP_PROVIDER = resolveOtpProvider();
-
-if (isProduction && OTP_PROVIDER === 'dev') {
-  console.error('FATAL: OTP_PROVIDER cannot be "dev" in production. Set OTP_PROVIDER=firebase or OTP_PROVIDER=sms.');
-  process.exit(1);
-}
-
-if (isProduction && OTP_PROVIDER === 'sms') {
-  if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN) {
-    console.error('FATAL: OTP_PROVIDER=sms requires TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN.');
-    process.exit(1);
-  }
-  if (!process.env.TWILIO_FROM_NUMBER && !process.env.TWILIO_MESSAGING_SERVICE_SID) {
-    console.error('FATAL: OTP_PROVIDER=sms requires TWILIO_FROM_NUMBER or TWILIO_MESSAGING_SERVICE_SID.');
-    process.exit(1);
-  }
-}
-
-function resolveAdminJwtSecret() {
-  const s = process.env.ADMIN_JWT_SECRET || process.env.JWT_SECRET;
-  if (isProduction) {
-    if (!s || typeof s !== 'string' || s.length < 32) {
-      console.error(
-        'FATAL: ADMIN_JWT_SECRET (or JWT_SECRET) must be set to a random string of at least 32 characters in production.'
-      );
-      process.exit(1);
-    }
-    const lower = s.toLowerCase();
-    if (
-      lower === 'change-admin-jwt-secret-in-production' ||
-      lower === 'secret' ||
-      lower === 'changeme' ||
-      lower === 'jwt_secret'
-    ) {
-      console.error('FATAL: ADMIN_JWT_SECRET is a weak or placeholder value.');
-      process.exit(1);
-    }
-    return s;
-  }
-  return s || 'dev-only-insecure-admin-jwt-do-not-use-in-production';
-}
-
-const ADMIN_JWT_SECRET = resolveAdminJwtSecret();
-
-/** Dev-only Firebase bypass; set ALLOW_FIREBASE_TEST_MODE=1 locally. Never enable in production. */
-const ALLOW_FIREBASE_TEST_MODE = !isProduction && process.env.ALLOW_FIREBASE_TEST_MODE === '1';
-
 const express = require('express');
 const cors = require('cors');
-const helmet = require('helmet');
-const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
 const { Pool } = require('pg');
 const multer = require('multer');
 const path = require('path');
@@ -73,78 +7,35 @@ const fs = require('fs');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcrypt');
 const { getFirebaseMessaging } = require('./services/firebaseService');
+const { verifyFirebaseIdToken } = require('./services/firebaseService');
+require('dotenv').config();
+
+const ADMIN_JWT_SECRET =
+  process.env.ADMIN_JWT_SECRET || process.env.JWT_SECRET || 'change-admin-jwt-secret-in-production';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-if (process.env.TRUST_PROXY === '1') {
-  app.set('trust proxy', 1);
+function normalizePhone(raw) {
+  const str = String(raw || '').trim();
+  if (!str) return '';
+  const digits = str.replace(/[^\d+]/g, '');
+  // +91XXXXXXXXXX
+  if (digits.startsWith('+91') && digits.length === 13) return digits.slice(3);
+  // 91XXXXXXXXXX
+  if (digits.startsWith('91') && digits.length === 12) return digits.slice(2);
+  // Already 10 digits
+  if (/^\d{10}$/.test(digits)) return digits;
+  // If user accidentally includes +, drop it and re-check
+  const onlyDigits = str.replace(/\D/g, '');
+  if (onlyDigits.startsWith('91') && onlyDigits.length === 12) return onlyDigits.slice(2);
+  if (/^\d{10}$/.test(onlyDigits)) return onlyDigits;
+  return str;
 }
 
-function buildCorsOptions() {
-  if (!isProduction) {
-    return { origin: true, credentials: true };
-  }
-  const list = (process.env.CORS_ORIGINS || '')
-    .split(',')
-    .map((x) => x.trim())
-    .filter(Boolean);
-  return {
-    origin(origin, callback) {
-      if (!origin) return callback(null, true);
-      if (list.includes(origin)) return callback(null, true);
-      callback(null, false);
-    },
-    credentials: true,
-  };
+function isBcryptHash(value) {
+  return typeof value === 'string' && /^\$2[aby]\$\d{2}\$/.test(value);
 }
-
-const sendOtpLimiter = rateLimit({
-  windowMs: Number(process.env.RATE_LIMIT_OTP_SEND_WINDOW_MS || 15 * 60 * 1000),
-  max: Number(process.env.RATE_LIMIT_OTP_SEND_MAX || 5),
-  message: { success: false, error: 'Too many OTP send attempts. Try again later.' },
-  standardHeaders: true,
-  legacyHeaders: false,
-  keyGenerator: (req) => {
-    const phone = normalizePhoneTo10Digits(req.body?.phone);
-    const ip = ipKeyGenerator(req.ip || '');
-    return phone ? `${ip}|${phone}` : ip;
-  },
-});
-
-const verifyOtpLimiter = rateLimit({
-  windowMs: Number(process.env.RATE_LIMIT_OTP_VERIFY_WINDOW_MS || 15 * 60 * 1000),
-  max: Number(process.env.RATE_LIMIT_OTP_VERIFY_MAX || 30),
-  message: { success: false, error: 'Too many verification attempts. Try again later.' },
-  standardHeaders: true,
-  legacyHeaders: false,
-  keyGenerator: (req) => {
-    const phone = normalizePhoneTo10Digits(req.body?.phone);
-    const ip = ipKeyGenerator(req.ip || '');
-    return phone ? `${ip}|${phone}` : ip;
-  },
-});
-
-const adminLoginLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: Number(process.env.RATE_LIMIT_ADMIN_LOGIN_MAX || 20),
-  message: { success: false, error: 'Too many login attempts. Try again later.' },
-  standardHeaders: true,
-  legacyHeaders: false,
-  keyGenerator: (req) => ipKeyGenerator(req.ip || ''),
-});
-
-const firebasePhoneLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: Number(process.env.RATE_LIMIT_FIREBASE_PHONE_MAX || 30),
-  standardHeaders: true,
-  legacyHeaders: false,
-  keyGenerator: (req) => {
-    const phone = normalizePhoneTo10Digits(req.body?.phone);
-    const ip = ipKeyGenerator(req.ip || '');
-    return phone ? `${ip}|${phone}` : ip;
-  },
-});
 
 // Create uploads directory if it doesn't exist
 const uploadsDir = path.join(__dirname, 'uploads', 'templates');
@@ -235,12 +126,7 @@ const profilePhotoUpload = multer({
 });
 
 // Middleware
-app.use(
-  helmet({
-    crossOriginResourcePolicy: { policy: 'cross-origin' },
-  })
-);
-app.use(cors(buildCorsOptions()));
+app.use(cors());
 app.use(express.json({ limit: '12mb' }));
 // Serve uploaded files statically
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
@@ -253,54 +139,6 @@ const pool = new Pool({
   user: process.env.DB_USER || 'postgres',
   password: process.env.DB_PASSWORD || '',
 });
-
-async function sendOtpViaTwilio(phone10, otp) {
-  const sid = process.env.TWILIO_ACCOUNT_SID;
-  const token = process.env.TWILIO_AUTH_TOKEN;
-  const messagingServiceSid = process.env.TWILIO_MESSAGING_SERVICE_SID;
-  const from = process.env.TWILIO_FROM_NUMBER;
-  const auth = Buffer.from(`${sid}:${token}`).toString('base64');
-  const to = `+91${phone10}`;
-  const body = new URLSearchParams();
-  body.set('To', to);
-  body.set('Body', `Your verification code is ${otp}. Do not share it with anyone.`);
-  if (messagingServiceSid) {
-    body.set('MessagingServiceSid', messagingServiceSid);
-  } else {
-    body.set('From', from);
-  }
-  const url = `https://api.twilio.com/2010-04-01/Accounts/${sid}/Messages.json`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      Authorization: `Basic ${auth}`,
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
-    body: body.toString(),
-  });
-  if (!res.ok) {
-    const txt = await res.text();
-    console.error('Twilio SMS error:', res.status, txt.slice(0, 300));
-    throw new Error('SMS delivery failed');
-  }
-}
-
-/**
- * When first_name, last_name, and category are present but profile_complete was never set
- * (legacy complete-profile updates), persist profile_complete = true.
- */
-async function syncProfileCompleteIfEligible(user) {
-  if (!user || user.id == null) return user;
-  const fn = user.first_name != null ? String(user.first_name).trim() : '';
-  const ln = user.last_name != null ? String(user.last_name).trim() : '';
-  const cat = user.category != null ? String(user.category).trim() : '';
-  if (!fn || !ln || !cat || user.profile_complete) return user;
-  const fixed = await pool.query(
-    `UPDATE profiles SET profile_complete = true, updated_at = NOW() WHERE id = $1 RETURNING *`,
-    [user.id]
-  );
-  return fixed.rows[0] || user;
-}
 
 async function ensureAdminUsersTable() {
   await pool.query(`
@@ -353,29 +191,6 @@ async function ensureAdminContentTables() {
     )
   `);
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS notification_broadcast_schedules (
-      id BIGSERIAL PRIMARY KEY,
-      run_at TIMESTAMPTZ NOT NULL,
-      status VARCHAR(32) NOT NULL DEFAULT 'pending',
-      title TEXT NOT NULL,
-      body TEXT NOT NULL,
-      data JSONB,
-      language VARCHAR(128),
-      state VARCHAR(255),
-      district VARCHAR(255),
-      tahsil VARCHAR(255),
-      recipient_count INT NOT NULL DEFAULT 0,
-      created_at TIMESTAMPTZ DEFAULT NOW(),
-      started_at TIMESTAMPTZ,
-      sent_at TIMESTAMPTZ,
-      last_error TEXT
-    )
-  `);
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_notification_broadcast_schedules_due
-    ON notification_broadcast_schedules (status, run_at ASC)
-  `);
-  await pool.query(`
     CREATE TABLE IF NOT EXISTS home_carousel_slides (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       image_url TEXT NOT NULL,
@@ -426,263 +241,6 @@ async function ensureAdminContentTables() {
     CREATE INDEX IF NOT EXISTS idx_user_suggestions_created_at
     ON user_suggestions (created_at DESC)
   `);
-
-  // Templates table is created elsewhere in some deployments; safely add scheduling columns.
-  await pool
-    .query(`ALTER TABLE templates ADD COLUMN IF NOT EXISTS publish_at TIMESTAMPTZ`)
-    .catch(() => {});
-  await pool
-    .query(`CREATE INDEX IF NOT EXISTS idx_templates_publish_at ON templates (status, publish_at ASC)`)
-    .catch(() => {});
-}
-
-function parseOptionalIsoDate(value) {
-  if (value == null) return null;
-  const s = String(value).trim();
-  if (!s) return null;
-  const d = new Date(s);
-  if (Number.isNaN(d.getTime())) return null;
-  return d;
-}
-
-async function sendBroadcastNow({
-  title,
-  bodyText,
-  dataPayload,
-  langF,
-  stateF,
-  districtF,
-  tahsilF,
-}) {
-  const insBroadcast = await pool.query(
-    `INSERT INTO notification_broadcasts (title, body, data, language, state, district, tahsil, recipient_count)
-       VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7, 0)
-       RETURNING id`,
-    [title, bodyText, JSON.stringify(dataPayload), langF, stateF, districtF, tahsilF]
-  );
-
-  const insertNotif = await pool.query(
-    `INSERT INTO notifications (user_id, type, title, message, data, is_read)
-       SELECT id, 'broadcast', $1, $2, $3::jsonb, false
-         FROM profiles
-        WHERE COALESCE(profile_complete, false) = true
-          AND ($4::text IS NULL OR COALESCE(language, '') = $4)
-          AND ($5::text IS NULL OR COALESCE(state, '') = $5)
-          AND ($6::text IS NULL OR COALESCE(district, '') = $6)
-          AND ($7::text IS NULL OR COALESCE(tahsil, '') = $7)`,
-    [title, bodyText, JSON.stringify(dataPayload), langF, stateF, districtF, tahsilF]
-  );
-  const recipientCount = insertNotif.rowCount || 0;
-
-  await pool.query(`UPDATE notification_broadcasts SET recipient_count = $1 WHERE id = $2`, [
-    recipientCount,
-    insBroadcast.rows[0].id,
-  ]);
-
-  const { rows: tokenRows } = await pool.query(
-    `SELECT DISTINCT dt.token
-         FROM device_tokens dt
-         INNER JOIN profiles p ON p.id = dt.user_id
-        WHERE dt.is_active = true
-          AND COALESCE(p.profile_complete, false) = true
-          AND ($1::text IS NULL OR COALESCE(p.language, '') = $1)
-          AND ($2::text IS NULL OR COALESCE(p.state, '') = $2)
-          AND ($3::text IS NULL OR COALESCE(p.district, '') = $3)
-          AND ($4::text IS NULL OR COALESCE(p.tahsil, '') = $4)`,
-    [langF, stateF, districtF, tahsilF]
-  );
-  const tokens = tokenRows.map((r) => r.token).filter(Boolean);
-  const messaging = getFirebaseMessaging();
-  let pushAttempted = 0;
-  let pushFailures = 0;
-  if (messaging && tokens.length > 0) {
-    const dataStrings = {};
-    try {
-      for (const [k, v] of Object.entries(dataPayload)) {
-        dataStrings[String(k)] = v == null ? '' : String(v);
-      }
-    } catch {
-      /* ignore */
-    }
-    const chunkSize = 500;
-    for (let i = 0; i < tokens.length; i += chunkSize) {
-      const chunk = tokens.slice(i, i + chunkSize);
-      pushAttempted += chunk.length;
-      try {
-        const resp = await messaging.sendEachForMulticast({
-          tokens: chunk,
-          notification: { title, body: bodyText },
-          data: dataStrings,
-        });
-        pushFailures += resp.failureCount || 0;
-      } catch (err) {
-        console.error('FCM multicast error', err);
-        pushFailures += chunk.length;
-      }
-    }
-  }
-
-  return {
-    broadcastId: insBroadcast.rows[0].id,
-    recipientCount,
-    push: { attempted: pushAttempted, failures: pushFailures },
-  };
-}
-
-function startScheduler() {
-  const pollMs = Number(process.env.SCHEDULER_POLL_MS || 30_000);
-  const maxBatch = Math.min(Math.max(Number(process.env.SCHEDULER_BATCH || 5), 1), 50);
-  let running = false;
-
-  async function tick() {
-    if (running) return;
-    running = true;
-    try {
-      // 1) Publish scheduled templates
-      await pool
-        .query(
-          `UPDATE templates
-              SET status = 'active',
-                  updated_at = NOW()
-            WHERE status = 'scheduled'
-              AND publish_at IS NOT NULL
-              AND publish_at <= NOW()`
-        )
-        .catch(() => {});
-
-      // 2) Send due scheduled notification broadcasts
-      const { rows: dueRows } = await pool.query(
-        `SELECT id, run_at, title, body, data, language, state, district, tahsil
-           FROM notification_broadcast_schedules
-          WHERE status = 'pending'
-            AND run_at <= NOW()
-          ORDER BY run_at ASC
-          LIMIT $1
-          FOR UPDATE SKIP LOCKED`,
-        [maxBatch]
-      );
-
-      for (const row of dueRows) {
-        await pool.query(
-          `UPDATE notification_broadcast_schedules
-              SET status = 'processing',
-                  started_at = NOW(),
-                  last_error = NULL
-            WHERE id = $1`,
-          [row.id]
-        );
-
-        try {
-          const result = await sendBroadcastNow({
-            title: String(row.title),
-            bodyText: String(row.body),
-            dataPayload:
-              row.data != null && typeof row.data === 'object' && !Array.isArray(row.data) ? { ...row.data } : {},
-            langF: row.language ?? null,
-            stateF: row.state ?? null,
-            districtF: row.district ?? null,
-            tahsilF: row.tahsil ?? null,
-          });
-
-          await pool.query(
-            `UPDATE notification_broadcast_schedules
-                SET status = 'sent',
-                    sent_at = NOW(),
-                    recipient_count = $2
-              WHERE id = $1`,
-            [row.id, result.recipientCount || 0]
-          );
-        } catch (e) {
-          await pool.query(
-            `UPDATE notification_broadcast_schedules
-                SET status = 'failed',
-                    last_error = $2
-              WHERE id = $1`,
-            [row.id, String(e?.message || e)]
-          );
-        }
-      }
-    } catch (e) {
-      console.error('scheduler tick error:', e);
-    } finally {
-      running = false;
-    }
-  }
-
-  setInterval(tick, pollMs);
-  // kick once on startup
-  tick().catch(() => {});
-}
-
-/**
- * Mobile users live in `profiles`; admin broadcasts insert notifications with profile ids.
- * Older DBs often have notifications.user_id → users(id), while new signups only touch profiles,
- * which causes FK violations. Point the FK at profiles when needed.
- */
-async function ensureNotificationsUserFkReferencesProfiles() {
-  try {
-    const { rows: cntRows } = await pool.query(
-      `SELECT COUNT(*)::int AS n
-         FROM information_schema.tables
-        WHERE table_schema = 'public'
-          AND table_name IN ('notifications', 'profiles')`
-    );
-    if (!cntRows[0] || cntRows[0].n < 2) return;
-
-    const { rows: fkRows } = await pool.query(
-      `SELECT tc.constraint_name, ccu.table_name AS ref_table
-         FROM information_schema.table_constraints tc
-         JOIN information_schema.key_column_usage kcu
-           ON tc.constraint_schema = kcu.constraint_schema
-          AND tc.constraint_name = kcu.constraint_name
-          AND tc.table_schema = kcu.table_schema
-         JOIN information_schema.constraint_column_usage ccu
-           ON ccu.constraint_schema = tc.constraint_schema
-          AND ccu.constraint_name = tc.constraint_name
-        WHERE tc.table_schema = 'public'
-          AND tc.table_name = 'notifications'
-          AND tc.constraint_type = 'FOREIGN KEY'
-          AND kcu.column_name = 'user_id'
-        LIMIT 1`
-    );
-
-    if (fkRows.length === 0) {
-      await pool
-        .query(
-          `ALTER TABLE notifications
-             ADD CONSTRAINT notifications_user_id_fkey
-             FOREIGN KEY (user_id) REFERENCES profiles(id) ON DELETE CASCADE`
-        )
-        .catch(() => {});
-      return;
-    }
-
-    const { constraint_name: fkName, ref_table: refTable } = fkRows[0];
-    if (refTable === 'profiles') return;
-
-    if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(String(fkName || ''))) {
-      console.warn('⚠️ Unexpected notifications.user_id FK constraint name:', fkName);
-      return;
-    }
-    await pool.query(`ALTER TABLE notifications DROP CONSTRAINT ${fkName}`);
-  } catch (e) {
-    console.warn('⚠️ notifications FK check (drop legacy):', e.message);
-    return;
-  }
-
-  try {
-    await pool.query(
-      `ALTER TABLE notifications
-         ADD CONSTRAINT notifications_user_id_fkey
-         FOREIGN KEY (user_id) REFERENCES profiles(id) ON DELETE CASCADE`
-    );
-    console.log('✅ notifications.user_id foreign key now references profiles');
-  } catch (e) {
-    console.warn(
-      '⚠️ Could not add notifications.user_id → profiles FK (fix manually if broadcasts still fail):',
-      e.message
-    );
-  }
 }
 
 // Test database connection + admin auth schema
@@ -692,9 +250,7 @@ async function ensureNotificationsUserFkReferencesProfiles() {
     console.log('✅ Database connected successfully');
     await ensureAdminUsersTable();
     await ensureAdminContentTables();
-    await ensureNotificationsUserFkReferencesProfiles();
     await seedAdminUserFromEnv();
-    startScheduler();
     const { rows: countRows } = await pool.query('SELECT COUNT(*)::int AS n FROM admin_users');
     if (countRows[0].n === 0) {
       console.warn(
@@ -712,8 +268,16 @@ app.use('/api/template-share', templateShareRoutes(pool));
 const publicApiRoutes = require('./routes/publicApiRoutes');
 app.use('/api', publicApiRoutes(pool));
 
-// In-memory OTP storage for SMS/dev OTP only (cleared on server restart)
+// In-memory OTP storage (temporary, cleared on server restart)
 const otpStore = new Map(); // phone -> { otp, expiresAt }
+
+// Hardcoded OTPs for testing (remove in production)
+// Note: OTPs must be 6 digits to match the frontend UI
+const HARDCODED_OTPS = {
+  '9876543210': '123456',
+  '9876543211': '567890',
+  '9876543212': '999999',
+};
 
 // Cleanup expired OTPs every 5 minutes
 setInterval(() => {
@@ -727,250 +291,29 @@ setInterval(() => {
 
 // ==================== AUTH ROUTES ====================
 
-const { verifyFirebaseIdToken } = require('./services/firebaseService');
-
-// Check if phone exists
+// Check phone exists (for signup flow)
 app.post('/api/auth/check-phone', async (req, res) => {
   try {
-    const phone = normalizePhoneTo10Digits(req.body?.phone);
+    const phone = normalizePhone(req.body?.phone);
     if (!phone) {
       return res.status(400).json({ success: false, error: 'Phone number required' });
     }
-
     if (phone.length !== 10 || !/^\d+$/.test(phone)) {
       return res.status(400).json({ success: false, error: 'Phone number must be 10 digits' });
     }
-
-    const result = await pool.query('SELECT id FROM profiles WHERE phone_number = $1', [phone]);
-    return res.json({ success: true, exists: result.rows.length > 0 });
-  } catch (error) {
-    console.error('Check phone error:', error);
-    return res.status(500).json({ success: false, error: error.message || 'Internal server error' });
-  }
-});
-
-// Firebase OTP fallback (dev only, ALLOW_FIREBASE_TEST_MODE=1). Production must use client Firebase Phone Auth.
-app.post('/api/auth/send-firebase-otp', firebasePhoneLimiter, async (req, res) => {
-  try {
-    const phone = normalizePhoneTo10Digits(req.body?.phone);
-    const fallback = !!req.body?.fallback;
-
-    if (!phone) {
-      return res.status(400).json({ success: false, error: 'Phone number required' });
-    }
-
-    if (!fallback) {
-      return res.status(400).json({
-        success: false,
-        error: 'Use Firebase Phone Authentication in the app (client SDK).',
-      });
-    }
-
-    if (!ALLOW_FIREBASE_TEST_MODE) {
-      return res.status(403).json({
-        success: false,
-        error: 'Backend test verification is disabled. Use Firebase Phone Auth in the app.',
-      });
-    }
-
-    return res.json({ success: true, verificationId: 'test-mode' });
-  } catch (error) {
-    console.error('Send Firebase OTP (fallback) error:', error);
-    return res.status(500).json({ success: false, error: error.message || 'Internal server error' });
-  }
-});
-
-// Verify Firebase OTP: validate Firebase ID token (preferred) or test-mode fallback (dev).
-app.post('/api/auth/verify-firebase-otp', firebasePhoneLimiter, async (req, res) => {
-  try {
-    const phone = normalizePhoneTo10Digits(req.body?.phone);
-    const firebaseIdToken = req.body?.firebaseIdToken;
-    const verificationId = req.body?.verificationId;
-    const password = req.body?.password;
-
-    if (!phone) {
-      return res.status(400).json({ success: false, error: 'Phone number required' });
-    }
-
-    if (phone.length !== 10 || !/^\d+$/.test(phone)) {
-      return res.status(400).json({ success: false, error: 'Phone number must be 10 digits' });
-    }
-
-    if (verificationId === 'test-mode' && !firebaseIdToken && !ALLOW_FIREBASE_TEST_MODE) {
-      return res.status(403).json({
-        success: false,
-        error: 'Test verification is disabled. Sign in with Firebase Phone Auth and send firebaseIdToken.',
-      });
-    }
-
-    // Test-mode fallback: dev only (ALLOW_FIREBASE_TEST_MODE=1).
-    if (verificationId === 'test-mode' && !firebaseIdToken) {
-      // If password provided and user doesn't exist, create the account.
-      const existing = await pool.query('SELECT * FROM profiles WHERE phone_number = $1', [phone]);
-      if (existing.rows.length > 0) {
-        const user = await syncProfileCompleteIfEligible(existing.rows[0]);
-        return res.json({ success: true, user });
-      }
-
-      if (!password) {
-        return res.status(400).json({ success: false, error: 'Password required for signup' });
-      }
-
-      const created = await pool.query(
-        `INSERT INTO profiles (phone_number, password, profile_complete)
-         VALUES ($1, $2, false)
-         RETURNING *`,
-        [phone, password]
-      );
-      return res.json({ success: true, user: created.rows[0] });
-    }
-
-    // Preferred: verify Firebase ID token.
-    const decoded = await verifyFirebaseIdToken(firebaseIdToken);
-    const tokenPhone10 = normalizePhoneTo10Digits(decoded?.phone_number || decoded?.phoneNumber || '');
-    if (!tokenPhone10 || tokenPhone10 !== phone) {
-      return res.status(401).json({ success: false, error: 'Invalid Firebase token for this phone number' });
-    }
-
-    // Upsert user: if exists, return it; else create if password provided.
-    const existing = await pool.query('SELECT * FROM profiles WHERE phone_number = $1', [phone]);
-    if (existing.rows.length > 0) {
-      const user = await syncProfileCompleteIfEligible(existing.rows[0]);
-      return res.json({ success: true, user });
-    }
-
-    if (!password) {
-      return res.status(400).json({ success: false, error: 'Password required for signup' });
-    }
-
-    const created = await pool.query(
-      `INSERT INTO profiles (phone_number, password, profile_complete)
-       VALUES ($1, $2, false)
-       RETURNING *`,
-      [phone, password]
-    );
-    return res.json({ success: true, user: created.rows[0] });
-  } catch (error) {
-    console.error('Verify Firebase OTP error:', error);
-    if (error.code === '23505') {
-      const phone = normalizePhoneTo10Digits(req.body?.phone);
-      const existing = await pool.query('SELECT * FROM profiles WHERE phone_number = $1', [phone]);
-      if (existing.rows.length > 0) {
-        const user = await syncProfileCompleteIfEligible(existing.rows[0]);
-        return res.json({ success: true, user });
-      }
-      return res.status(400).json({ success: false, error: 'Phone number already registered' });
-    }
-    return res.status(500).json({ success: false, error: error.message || 'Internal server error' });
-  }
-});
-
-// Confirm Firebase phone ownership for password reset (no user session returned)
-app.post('/api/auth/verify-phone-for-reset', firebasePhoneLimiter, async (req, res) => {
-  try {
-    const phone = normalizePhoneTo10Digits(req.body?.phone);
-    const firebaseIdToken = req.body?.firebaseIdToken;
-    const verificationId = req.body?.verificationId;
-
-    if (!phone || phone.length !== 10 || !/^\d+$/.test(phone)) {
-      return res.status(400).json({ success: false, error: 'Valid 10-digit phone number required' });
-    }
-
-    if (verificationId === 'test-mode' && !firebaseIdToken && !ALLOW_FIREBASE_TEST_MODE) {
-      return res.status(403).json({ success: false, error: 'Test verification is disabled.' });
-    }
-
-    if (verificationId === 'test-mode' && !firebaseIdToken) {
-      const existing = await pool.query('SELECT id FROM profiles WHERE phone_number = $1', [phone]);
-      if (existing.rows.length === 0) {
-        return res.status(404).json({ success: false, error: 'No account found for this number' });
-      }
-      return res.json({ success: true });
-    }
-
-    if (!firebaseIdToken) {
-      return res.status(400).json({ success: false, error: 'Verification required' });
-    }
-
-    const decoded = await verifyFirebaseIdToken(firebaseIdToken);
-    const tokenPhone10 = normalizePhoneTo10Digits(decoded?.phone_number || decoded?.phoneNumber || '');
-    if (!tokenPhone10 || tokenPhone10 !== phone) {
-      return res.status(401).json({ success: false, error: 'Invalid Firebase token for this phone number' });
-    }
-
     const existing = await pool.query('SELECT id FROM profiles WHERE phone_number = $1', [phone]);
-    if (existing.rows.length === 0) {
-      return res.status(404).json({ success: false, error: 'No account found for this number' });
-    }
-
-    return res.json({ success: true });
+    return res.json({ success: true, exists: existing.rows.length > 0 });
   } catch (error) {
-    console.error('Verify phone for reset error:', error);
-    return res.status(401).json({ success: false, error: error.message || 'Verification failed' });
-  }
-});
-
-// Set new password after phone verification (Firebase ID token or dev test-mode)
-app.post('/api/auth/reset-password', firebasePhoneLimiter, async (req, res) => {
-  try {
-    const phone = normalizePhoneTo10Digits(req.body?.phone);
-    const firebaseIdToken = req.body?.firebaseIdToken;
-    const verificationId = req.body?.verificationId;
-    const newPassword = req.body?.newPassword != null ? String(req.body.newPassword) : '';
-
-    if (!phone || phone.length !== 10 || !/^\d+$/.test(phone)) {
-      return res.status(400).json({ success: false, error: 'Valid 10-digit phone number required' });
-    }
-    if (!newPassword || newPassword.length < 6) {
-      return res.status(400).json({ success: false, error: 'Password must be at least 6 characters' });
-    }
-
-    if (verificationId === 'test-mode' && !firebaseIdToken && !ALLOW_FIREBASE_TEST_MODE) {
-      return res.status(403).json({ success: false, error: 'Test verification is disabled.' });
-    }
-
-    if (verificationId === 'test-mode' && !firebaseIdToken) {
-      const updated = await pool.query(
-        `UPDATE profiles SET password = $1, updated_at = NOW() WHERE phone_number = $2 RETURNING *`,
-        [newPassword, phone]
-      );
-      if (updated.rows.length === 0) {
-        return res.status(404).json({ success: false, error: 'No account found for this number' });
-      }
-      const user = await syncProfileCompleteIfEligible(updated.rows[0]);
-      return res.json({ success: true, user });
-    }
-
-    if (!firebaseIdToken) {
-      return res.status(400).json({ success: false, error: 'Verification required' });
-    }
-
-    const decoded = await verifyFirebaseIdToken(firebaseIdToken);
-    const tokenPhone10 = normalizePhoneTo10Digits(decoded?.phone_number || decoded?.phoneNumber || '');
-    if (!tokenPhone10 || tokenPhone10 !== phone) {
-      return res.status(401).json({ success: false, error: 'Invalid Firebase token for this phone number' });
-    }
-
-    const updated = await pool.query(
-      `UPDATE profiles SET password = $1, updated_at = NOW() WHERE phone_number = $2 RETURNING *`,
-      [newPassword, phone]
-    );
-    if (updated.rows.length === 0) {
-      return res.status(404).json({ success: false, error: 'No account found for this number' });
-    }
-    const user = await syncProfileCompleteIfEligible(updated.rows[0]);
-    return res.json({ success: true, user });
-  } catch (error) {
-    console.error('Reset password error:', error);
-    return res.status(500).json({ success: false, error: error.message || 'Failed to reset password' });
+    console.error('check-phone error:', error);
+    return res.status(500).json({ success: false, error: error.message || 'Internal server error' });
   }
 });
 
 // Sign Up
 app.post('/api/auth/signup', async (req, res) => {
   try {
-    const phone = normalizePhoneTo10Digits(req.body?.phone);
-    const { password } = req.body;
+    const phone = normalizePhone(req.body?.phone);
+    const password = req.body?.password;
 
     console.log('Signup request received:', { phone: phone ? `${phone.substring(0, 3)}***` : 'missing', hasPassword: !!password });
 
@@ -996,12 +339,14 @@ app.post('/api/auth/signup', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Phone number already registered' });
     }
 
+    const passwordHash = await bcrypt.hash(String(password), 10);
+
     // Insert new user
     const result = await pool.query(
       `INSERT INTO profiles (phone_number, password, profile_complete)
        VALUES ($1, $2, false)
        RETURNING *`,
-      [phone, password]
+      [phone, passwordHash]
     );
 
     console.log('Signup successful for phone:', phone.substring(0, 3) + '***');
@@ -1019,22 +364,44 @@ app.post('/api/auth/signup', async (req, res) => {
 // Login
 app.post('/api/auth/login', async (req, res) => {
   try {
-    const { phone, password } = req.body;
+    const phone = normalizePhone(req.body?.phone);
+    const password = req.body?.password;
 
     if (!phone || !password) {
       return res.status(400).json({ success: false, error: 'Phone and password required' });
     }
 
-    const result = await pool.query(
-      'SELECT * FROM profiles WHERE phone_number = $1 AND password = $2',
-      [phone, password]
-    );
+    const result = await pool.query('SELECT * FROM profiles WHERE phone_number = $1', [phone]);
 
     if (result.rows.length === 0) {
-      return res.status(401).json({ success: false, error: 'Invalid phone or password' });
+      // Frontend expects requiresSignup for non-registered users
+      return res
+        .status(404)
+        .json({ success: false, error: 'Phone number not registered', requiresSignup: true });
     }
 
-    let user = await syncProfileCompleteIfEligible(result.rows[0]);
+    const user = result.rows[0];
+    const stored = user.password;
+    let ok = false;
+    if (isBcryptHash(stored)) {
+      ok = await bcrypt.compare(String(password), stored);
+    } else {
+      ok = String(stored || '') === String(password);
+      // Opportunistically upgrade legacy plaintext passwords to bcrypt on successful login.
+      if (ok) {
+        try {
+          const newHash = await bcrypt.hash(String(password), 10);
+          await pool.query('UPDATE profiles SET password = $1 WHERE id = $2', [newHash, user.id]);
+          user.password = newHash;
+        } catch (e) {
+          console.warn('Password hash upgrade failed:', e?.message || e);
+        }
+      }
+    }
+
+    if (!ok) {
+      return res.status(401).json({ success: false, error: 'Invalid phone or password' });
+    }
 
     // If user has completed profile, they can login directly (no OTP needed)
     // OTP is only required during initial signup/verification
@@ -1050,96 +417,200 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-// Send OTP (SMS or dev random). In production with OTP_PROVIDER=firebase, use Firebase in the app instead.
-app.post('/api/auth/send-otp', sendOtpLimiter, async (req, res) => {
+// Send OTP
+app.post('/api/auth/send-otp', async (req, res) => {
   try {
-    const phone = normalizePhoneTo10Digits(req.body?.phone);
-    if (!phone || phone.length !== 10 || !/^\d+$/.test(phone)) {
-      return res.status(400).json({ success: false, error: 'Valid 10-digit phone number required' });
+    const { phone } = req.body;
+
+    if (!phone) {
+      return res.status(400).json({ success: false, error: 'Phone number required' });
     }
 
-    if (OTP_PROVIDER === 'firebase') {
-      return res.status(400).json({
-        success: false,
-        error:
-          'Server-side SMS OTP is disabled. Use Firebase Phone Authentication in the app, then verify-firebase-otp.',
-        code: 'USE_FIREBASE_PHONE_AUTH',
-      });
-    }
+    const otp = HARDCODED_OTPS[phone] || '000000'; // Default to 6-digit OTP
+    const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
 
-    const otp = String(crypto.randomInt(100000, 1000000));
-    const expiresAt = Date.now() + 10 * 60 * 1000;
-
-    if (OTP_PROVIDER === 'dev') {
-      otpStore.set(phone, { otp, expiresAt });
-      if (process.env.LOG_DEV_OTP === '1') {
-        console.log(`[dev-otp] ${phone}: ${otp}`);
-      } else {
-        console.log(`[dev-otp] OTP generated for ***${phone.slice(-4)} (set LOG_DEV_OTP=1 to log full code)`);
-      }
-      return res.json({ success: true });
-    }
-
-    // sms
+    // Store OTP in memory
     otpStore.set(phone, { otp, expiresAt });
-    await sendOtpViaTwilio(phone, otp);
-    return res.json({ success: true });
+
+    console.log(`OTP for ${phone}: ${otp}`);
+    res.json({ success: true });
   } catch (error) {
     console.error('Send OTP error:', error);
-    const phone = normalizePhoneTo10Digits(req.body?.phone);
-    if (phone) otpStore.delete(phone);
-    res.status(500).json({ success: false, error: 'Failed to send verification code' });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// Verify OTP (pairs with send-otp for sms/dev only)
-app.post('/api/auth/verify-otp', verifyOtpLimiter, async (req, res) => {
+// Verify OTP
+app.post('/api/auth/verify-otp', async (req, res) => {
   try {
-    if (OTP_PROVIDER === 'firebase') {
-      return res.status(400).json({
-        success: false,
-        error: 'Use Firebase Phone Authentication and verify-firebase-otp.',
-        code: 'USE_FIREBASE_PHONE_AUTH',
-      });
-    }
+    const phone = normalizePhone(req.body?.phone);
+    const otp = req.body?.otp;
 
-    const phone = normalizePhoneTo10Digits(req.body?.phone);
-    const otp = req.body?.otp != null ? String(req.body.otp) : '';
+    console.log('Verify OTP request received:', { 
+      phone: phone ? `${phone.substring(0, 3)}***` : 'missing', 
+      otpLength: otp ? otp.length : 0,
+      otpPreview: otp ? `${otp.substring(0, 2)}****` : 'missing'
+    });
 
     if (!phone || !otp) {
+      console.log('Verify OTP validation failed: missing phone or OTP');
       return res.status(400).json({ success: false, error: 'Phone and OTP required' });
     }
 
+    // Validate OTP format (should be 6 digits)
     if (otp.length !== 6 || !/^\d+$/.test(otp)) {
+      console.log('Verify OTP validation failed: invalid OTP format');
       return res.status(400).json({ success: false, error: 'OTP must be 6 digits' });
     }
 
+    // Get OTP from memory
     const otpData = otpStore.get(phone);
 
     if (!otpData) {
+      console.log('Verify OTP failed: No OTP session found for phone:', phone.substring(0, 3) + '***');
+      console.log('Available OTP sessions:', Array.from(otpStore.keys()).map(p => p.substring(0, 3) + '***'));
       return res.status(400).json({ success: false, error: 'No OTP session found. Please request a new OTP.' });
     }
 
+    // Check if expired
     if (otpData.expiresAt < Date.now()) {
+      console.log('Verify OTP failed: OTP expired');
       otpStore.delete(phone);
       return res.status(400).json({ success: false, error: 'OTP expired. Please request a new OTP.' });
     }
 
+    // Check if OTP matches
+    console.log('Comparing OTPs - Expected:', otpData.otp, 'Received:', otp);
     if (otpData.otp !== otp) {
+      console.log('Verify OTP failed: OTP mismatch');
       return res.status(400).json({ success: false, error: 'Invalid OTP' });
     }
 
-    const userResult = await pool.query('SELECT * FROM profiles WHERE phone_number = $1', [phone]);
+    // Get user profile
+    const userResult = await pool.query(
+      'SELECT * FROM profiles WHERE phone_number = $1',
+      [phone]
+    );
 
     if (userResult.rows.length === 0) {
+      console.log('Verify OTP failed: User not found');
       return res.status(404).json({ success: false, error: 'User not found' });
     }
 
+    // Delete OTP after successful verification (one-time use)
     otpStore.delete(phone);
+    console.log('OTP verified successfully for phone:', phone.substring(0, 3) + '***');
+
     res.json({ success: true, user: userResult.rows[0] });
   } catch (error) {
     console.error('Verify OTP error:', error);
     res.status(500).json({ success: false, error: error.message || 'Internal server error' });
+  }
+});
+
+// Firebase OTP: backend fallback "send" (dev only)
+app.post('/api/auth/send-firebase-otp', async (req, res) => {
+  try {
+    const phone = normalizePhone(req.body?.phone);
+    const fallback = Boolean(req.body?.fallback);
+    if (!phone) {
+      return res.status(400).json({ success: false, error: 'Phone number required' });
+    }
+
+    // This backend does NOT send real SMS. Client Firebase SDK handles OTP.
+    // For local/dev fallback paths (Expo Go), return a test verificationId.
+    const allowTest =
+      process.env.ALLOW_TEST_MODE_OTP === '1' || process.env.NODE_ENV !== 'production';
+    if (fallback && allowTest) {
+      return res.json({ success: true, verificationId: 'test-mode' });
+    }
+
+    return res.status(400).json({
+      success: false,
+      error:
+        'OTP must be sent from client Firebase SDK. Backend fallback is disabled (set ALLOW_TEST_MODE_OTP=1 for dev).',
+    });
+  } catch (error) {
+    console.error('send-firebase-otp error:', error);
+    return res.status(500).json({ success: false, error: error.message || 'Internal server error' });
+  }
+});
+
+// Firebase OTP verification (preferred path): verify Firebase ID token, then upsert profile
+app.post('/api/auth/verify-firebase-otp', async (req, res) => {
+  try {
+    const phone = normalizePhone(req.body?.phone);
+    const firebaseIdToken = req.body?.firebaseIdToken;
+    const verificationId = req.body?.verificationId;
+    const password = req.body?.password;
+
+    if (!phone) {
+      return res.status(400).json({ success: false, error: 'Phone number required' });
+    }
+    if (phone.length !== 10 || !/^\d+$/.test(phone)) {
+      return res.status(400).json({ success: false, error: 'Phone number must be 10 digits' });
+    }
+
+    const allowTest =
+      process.env.ALLOW_TEST_MODE_OTP === '1' || process.env.NODE_ENV !== 'production';
+
+    let verifiedPhone = null;
+    if (firebaseIdToken) {
+      const decoded = await verifyFirebaseIdToken(String(firebaseIdToken));
+      verifiedPhone = decoded?.phone_number ? normalizePhone(decoded.phone_number) : null;
+      if (!verifiedPhone) {
+        return res.status(401).json({ success: false, error: 'Firebase token missing phone_number' });
+      }
+      if (verifiedPhone !== phone) {
+        return res.status(401).json({ success: false, error: 'Phone mismatch for Firebase token' });
+      }
+    } else {
+      // Test-mode path: only allowed in non-production (or explicitly enabled).
+      if (!(allowTest && verificationId === 'test-mode')) {
+        return res.status(400).json({
+          success: false,
+          error: 'firebaseIdToken is required (test-mode allowed only in dev).',
+        });
+      }
+    }
+
+    const existing = await pool.query('SELECT * FROM profiles WHERE phone_number = $1', [phone]);
+    if (existing.rows.length > 0) {
+      const user = existing.rows[0];
+      // If password provided during signup flow, set it (hashing) only if not already set as bcrypt.
+      if (password) {
+        const stored = user.password;
+        if (!isBcryptHash(stored)) {
+          const passwordHash = await bcrypt.hash(String(password), 10);
+          const upd = await pool.query(
+            'UPDATE profiles SET password = $1, updated_at = NOW() WHERE id = $2 RETURNING *',
+            [passwordHash, user.id]
+          );
+          return res.json({ success: true, user: upd.rows[0] });
+        }
+      }
+      return res.json({ success: true, user });
+    }
+
+    // Create new profile only if password provided (signup after OTP)
+    if (!password) {
+      return res.status(400).json({
+        success: false,
+        error: 'Account not found. Password is required to create a new account.',
+      });
+    }
+
+    const passwordHash = await bcrypt.hash(String(password), 10);
+    const created = await pool.query(
+      `INSERT INTO profiles (phone_number, password, profile_complete)
+       VALUES ($1, $2, false)
+       RETURNING *`,
+      [phone, passwordHash]
+    );
+    return res.json({ success: true, user: created.rows[0] });
+  } catch (error) {
+    console.error('verify-firebase-otp error:', error);
+    return res.status(500).json({ success: false, error: error.message || 'Internal server error' });
   }
 });
 
@@ -1229,6 +700,9 @@ app.put('/api/auth/complete-profile', async (req, res) => {
       values.push(profileData.profile_photo_url || null);
     }
 
+    // Mark profile complete when user submits profile flow from app
+    updateFields.push(`profile_complete = true`);
+
     // Always update updated_at
     updateFields.push(`updated_at = NOW()`);
 
@@ -1256,17 +730,14 @@ app.put('/api/auth/complete-profile', async (req, res) => {
       return res.status(404).json({ success: false, error: 'User not found' });
     }
 
-    const user = await syncProfileCompleteIfEligible(result.rows[0]);
-
     console.log('Profile updated successfully:', {
-      userId: user.id,
-      first_name: user.first_name,
-      email: user.email,
-      state: user.state,
-      profile_complete: user.profile_complete,
+      userId: result.rows[0].id,
+      first_name: result.rows[0].first_name,
+      email: result.rows[0].email,
+      state: result.rows[0].state,
     });
 
-    res.json({ success: true, user });
+    res.json({ success: true, user: result.rows[0] });
   } catch (error) {
     console.error('Complete profile error:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -1287,8 +758,7 @@ app.get('/api/auth/profile/:userId', async (req, res) => {
       return res.status(404).json({ success: false, error: 'User not found' });
     }
 
-    const user = await syncProfileCompleteIfEligible(result.rows[0]);
-    res.json({ success: true, user });
+    res.json({ success: true, user: result.rows[0] });
   } catch (error) {
     console.error('Get profile error:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -1396,7 +866,7 @@ app.post('/api/auth/upload-profile-photo-base64', async (req, res) => {
 
 // ==================== ADMIN WORKSPACE AUTH ====================
 
-app.post('/api/admin/auth/login', adminLoginLimiter, async (req, res) => {
+app.post('/api/admin/auth/login', async (req, res) => {
   try {
     const { username, password } = req.body || {};
     if (!username || !password) {
@@ -1680,21 +1150,6 @@ app.get('/api/admin/notifications', async (_req, res) => {
   }
 });
 
-app.get('/api/admin/notifications/scheduled', async (_req, res) => {
-  try {
-    const { rows } = await pool.query(
-      `SELECT id, run_at, status, title, body, data, language, state, district, tahsil, recipient_count, created_at, started_at, sent_at, last_error
-         FROM notification_broadcast_schedules
-        ORDER BY run_at DESC
-        LIMIT 200`
-    );
-    res.json({ success: true, data: rows });
-  } catch (error) {
-    console.error('admin GET /notifications/scheduled error:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
 app.get('/api/admin/suggestions', async (_req, res) => {
   try {
     const { rows } = await pool.query(
@@ -1720,7 +1175,6 @@ app.post('/api/admin/notifications', async (req, res) => {
     if (!title || !bodyText) {
       return res.status(400).json({ success: false, error: 'Title and message are required' });
     }
-    const scheduleAt = parseOptionalIsoDate(req.body.schedule_at);
     let dataPayload =
       req.body.data != null && typeof req.body.data === 'object' && !Array.isArray(req.body.data)
         ? { ...req.body.data }
@@ -1746,29 +1200,80 @@ app.post('/api/admin/notifications', async (req, res) => {
     const tahsilF =
       req.body.tahsil != null && String(req.body.tahsil).trim() ? String(req.body.tahsil).trim() : null;
 
-    // If schedule_at is present and in the future, queue it instead of sending now.
-    if (scheduleAt && scheduleAt.getTime() > Date.now() + 5_000) {
-      const { rows } = await pool.query(
-        `INSERT INTO notification_broadcast_schedules
-           (run_at, status, title, body, data, language, state, district, tahsil)
-         VALUES ($1, 'pending', $2, $3, $4::jsonb, $5, $6, $7, $8)
-         RETURNING id, run_at, status`,
-        [
-          scheduleAt.toISOString(),
-          title,
-          bodyText,
-          JSON.stringify(dataPayload),
-          langF,
-          stateF,
-          districtF,
-          tahsilF,
-        ]
-      );
-      return res.json({ success: true, scheduled: true, data: rows[0] });
+    const insBroadcast = await pool.query(
+      `INSERT INTO notification_broadcasts (title, body, data, language, state, district, tahsil, recipient_count)
+       VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7, 0)
+       RETURNING id`,
+      [title, bodyText, JSON.stringify(dataPayload), langF, stateF, districtF, tahsilF]
+    );
+
+    const insertNotif = await pool.query(
+      `INSERT INTO notifications (user_id, type, title, message, data, is_read)
+       SELECT id, 'broadcast', $1, $2, $3::jsonb, false
+         FROM profiles
+        WHERE COALESCE(profile_complete, false) = true
+          AND ($4::text IS NULL OR COALESCE(language, '') = $4)
+          AND ($5::text IS NULL OR COALESCE(state, '') = $5)
+          AND ($6::text IS NULL OR COALESCE(district, '') = $6)
+          AND ($7::text IS NULL OR COALESCE(tahsil, '') = $7)`,
+      [title, bodyText, JSON.stringify(dataPayload), langF, stateF, districtF, tahsilF]
+    );
+    const recipientCount = insertNotif.rowCount || 0;
+
+    await pool.query(`UPDATE notification_broadcasts SET recipient_count = $1 WHERE id = $2`, [
+      recipientCount,
+      insBroadcast.rows[0].id,
+    ]);
+
+    const { rows: tokenRows } = await pool.query(
+      `SELECT DISTINCT dt.token
+         FROM device_tokens dt
+         INNER JOIN profiles p ON p.id = dt.user_id
+        WHERE dt.is_active = true
+          AND COALESCE(p.profile_complete, false) = true
+          AND ($1::text IS NULL OR COALESCE(p.language, '') = $1)
+          AND ($2::text IS NULL OR COALESCE(p.state, '') = $2)
+          AND ($3::text IS NULL OR COALESCE(p.district, '') = $3)
+          AND ($4::text IS NULL OR COALESCE(p.tahsil, '') = $4)`,
+      [langF, stateF, districtF, tahsilF]
+    );
+    const tokens = tokenRows.map((r) => r.token).filter(Boolean);
+    const messaging = getFirebaseMessaging();
+    let pushAttempted = 0;
+    let pushFailures = 0;
+    if (messaging && tokens.length > 0) {
+      const dataStrings = {};
+      try {
+        for (const [k, v] of Object.entries(dataPayload)) {
+          dataStrings[String(k)] = v == null ? '' : String(v);
+        }
+      } catch {
+        /* ignore */
+      }
+      const chunkSize = 500;
+      for (let i = 0; i < tokens.length; i += chunkSize) {
+        const chunk = tokens.slice(i, i + chunkSize);
+        pushAttempted += chunk.length;
+        try {
+          const resp = await messaging.sendEachForMulticast({
+            tokens: chunk,
+            notification: { title, body: bodyText },
+            data: dataStrings,
+          });
+          pushFailures += resp.failureCount || 0;
+        } catch (err) {
+          console.error('FCM multicast error', err);
+          pushFailures += chunk.length;
+        }
+      }
     }
 
-    const result = await sendBroadcastNow({ title, bodyText, dataPayload, langF, stateF, districtF, tahsilF });
-    res.json({ success: true, scheduled: false, ...result });
+    res.json({
+      success: true,
+      broadcastId: insBroadcast.rows[0].id,
+      recipientCount,
+      push: { attempted: pushAttempted, failures: pushFailures },
+    });
   } catch (error) {
     console.error('admin POST /notifications error:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -2030,7 +1535,6 @@ app.delete('/api/admin/categories/:id', async (req, res) => {
 app.post('/api/admin/templates', upload.single('file'), async (req, res) => {
   try {
     const { name, category_slug, description, file_format, aspect_ratio } = req.body;
-    const publishAt = parseOptionalIsoDate(req.body.publish_at);
 
     if (!name || !category_slug || !file_format || !aspect_ratio) {
       // Delete uploaded file if validation fails
@@ -2044,86 +1548,34 @@ app.post('/api/admin/templates', upload.single('file'), async (req, res) => {
       return res.status(400).json({ success: false, error: 'File is required' });
     }
 
-    // Verify category exists (supports both legacy category_slug and normalized category_id schema)
-    const hasCategoryId = await pool
-      .query(
-        `SELECT 1
-           FROM information_schema.columns
-          WHERE table_schema='public' AND table_name='templates' AND column_name='category_id'
-          LIMIT 1`
-      )
-      .then((r) => (r.rows?.length || 0) > 0)
-      .catch(() => true);
-
-    let categoryId = null;
-    if (hasCategoryId) {
-      const categoryCheck = await pool.query(
-        'SELECT id FROM categories WHERE slug = $1 AND is_active = true LIMIT 1',
-        [category_slug]
-      );
-      if (categoryCheck.rows.length === 0) {
-        fs.unlinkSync(req.file.path);
-        return res.status(400).json({ success: false, error: 'Invalid or inactive category' });
-      }
-      categoryId = categoryCheck.rows[0].id;
-    } else {
-      const categoryCheck = await pool.query(
-        `SELECT 1
-           FROM categories
-          WHERE slug = $1 AND is_active = true
-          LIMIT 1`,
-        [category_slug]
-      );
-      if (categoryCheck.rows.length === 0) {
-        fs.unlinkSync(req.file.path);
-        return res.status(400).json({ success: false, error: 'Invalid or inactive category' });
-      }
+    // Verify category exists
+    const categoryCheck = await pool.query('SELECT id FROM categories WHERE slug = $1 AND is_active = true', [category_slug]);
+    if (categoryCheck.rows.length === 0) {
+      // Delete uploaded file if category doesn't exist
+      fs.unlinkSync(req.file.path);
+      return res.status(400).json({ success: false, error: 'Invalid or inactive category' });
     }
 
     // Construct file URL (relative to uploads directory)
     const fileUrl = `/uploads/templates/${req.file.filename}`;
 
     // Insert template into database
-    const initialStatus =
-      publishAt && publishAt.getTime() > Date.now() + 5_000
-        ? 'scheduled'
-        : 'draft';
-
-    const result = hasCategoryId
-      ? await pool.query(
-          `INSERT INTO templates (name, category_id, description, file_format, aspect_ratio, file_url, file_name, file_size, status, publish_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-           RETURNING *`,
-          [
-            name,
-            categoryId,
-            description || null,
-            file_format,
-            aspect_ratio,
-            fileUrl,
-            req.file.originalname,
-            req.file.size,
-            initialStatus,
-            publishAt ? publishAt.toISOString() : null,
-          ]
-        )
-      : await pool.query(
-          `INSERT INTO templates (name, category_slug, description, file_format, aspect_ratio, file_url, file_name, file_size, status, publish_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-           RETURNING *`,
-          [
-            name,
-            category_slug,
-            description || null,
-            file_format,
-            aspect_ratio,
-            fileUrl,
-            req.file.originalname,
-            req.file.size,
-            initialStatus,
-            publishAt ? publishAt.toISOString() : null,
-          ]
-        );
+    const result = await pool.query(
+      `INSERT INTO templates (name, category_slug, description, file_format, aspect_ratio, file_url, file_name, file_size, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       RETURNING *`,
+      [
+        name,
+        category_slug,
+        description || null,
+        file_format,
+        aspect_ratio,
+        fileUrl,
+        req.file.originalname,
+        req.file.size,
+        'draft' // Default to draft status
+      ]
+    );
 
     console.log('Template created successfully:', result.rows[0].id);
     res.json({ success: true, data: result.rows[0] });
@@ -2146,8 +1598,6 @@ app.get('/api/admin/templates', async (req, res) => {
   try {
     const { category, status, search } = req.query;
     
-    // This deployment uses templates.category_id (uuid). Some older codepaths referenced category_slug,
-    // but that column doesn't exist in the current schema.
     let query = `
       SELECT 
         t.*,
@@ -2155,15 +1605,14 @@ app.get('/api/admin/templates', async (req, res) => {
         c.icon as category_icon,
         c.color as category_color
       FROM templates t
-      LEFT JOIN categories c ON t.category_id = c.id
+      LEFT JOIN categories c ON t.category_slug = c.slug
       WHERE 1=1
     `;
-
     const params = [];
     let paramIndex = 1;
 
     if (category && category !== 'all') {
-      query += ` AND c.slug = $${paramIndex++}`;
+      query += ` AND t.category_slug = $${paramIndex++}`;
       params.push(category);
     }
 
@@ -2200,7 +1649,7 @@ app.get('/api/admin/templates/:id', async (req, res) => {
         c.icon as category_icon,
         c.color as category_color
        FROM templates t
-       LEFT JOIN categories c ON t.category_id = c.id
+       LEFT JOIN categories c ON t.category_slug = c.slug
        WHERE t.id = $1`,
       [id]
     );
@@ -2220,7 +1669,7 @@ app.get('/api/admin/templates/:id', async (req, res) => {
 app.put('/api/admin/templates/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, category_slug, description, file_format, aspect_ratio, status, publish_at } = req.body;
+    const { name, category_slug, description, file_format, aspect_ratio, status } = req.body;
 
     const updateFields = [];
     const values = [];
@@ -2249,23 +1698,6 @@ app.put('/api/admin/templates/:id', async (req, res) => {
     if (status !== undefined) {
       updateFields.push(`status = $${paramIndex++}`);
       values.push(status);
-      // If manually setting active/draft/archived, clear publish_at to avoid surprise auto-publish later.
-      if (String(status).toLowerCase() !== 'scheduled') {
-        updateFields.push(`publish_at = NULL`);
-      }
-    }
-
-    if (publish_at !== undefined) {
-      const d = parseOptionalIsoDate(publish_at);
-      if (!d) {
-        return res.status(400).json({ success: false, error: 'publish_at must be a valid ISO datetime string' });
-      }
-      updateFields.push(`publish_at = $${paramIndex++}`);
-      values.push(d.toISOString());
-      // If publish_at is in the future, mark scheduled unless explicitly active.
-      if (status === undefined) {
-        updateFields.push(`status = 'scheduled'`);
-      }
     }
 
     updateFields.push(`updated_at = NOW()`);
@@ -2330,7 +1762,6 @@ app.delete('/api/admin/templates/:id', async (req, res) => {
 app.post('/api/admin/templates', upload.single('file'), async (req, res) => {
   try {
     const { name, category_slug, description, file_format, aspect_ratio } = req.body;
-    const publishAt = parseOptionalIsoDate(req.body.publish_at);
 
     if (!name || !category_slug || !file_format || !aspect_ratio) {
       // Delete uploaded file if validation fails
@@ -2344,86 +1775,34 @@ app.post('/api/admin/templates', upload.single('file'), async (req, res) => {
       return res.status(400).json({ success: false, error: 'File is required' });
     }
 
-    // Verify category exists (supports both legacy category_slug and normalized category_id schema)
-    const hasCategoryId = await pool
-      .query(
-        `SELECT 1
-           FROM information_schema.columns
-          WHERE table_schema='public' AND table_name='templates' AND column_name='category_id'
-          LIMIT 1`
-      )
-      .then((r) => (r.rows?.length || 0) > 0)
-      .catch(() => true);
-
-    let categoryId = null;
-    if (hasCategoryId) {
-      const categoryCheck = await pool.query(
-        'SELECT id FROM categories WHERE slug = $1 AND is_active = true LIMIT 1',
-        [category_slug]
-      );
-      if (categoryCheck.rows.length === 0) {
-        fs.unlinkSync(req.file.path);
-        return res.status(400).json({ success: false, error: 'Invalid or inactive category' });
-      }
-      categoryId = categoryCheck.rows[0].id;
-    } else {
-      const categoryCheck = await pool.query(
-        `SELECT 1
-           FROM categories
-          WHERE slug = $1 AND is_active = true
-          LIMIT 1`,
-        [category_slug]
-      );
-      if (categoryCheck.rows.length === 0) {
-        fs.unlinkSync(req.file.path);
-        return res.status(400).json({ success: false, error: 'Invalid or inactive category' });
-      }
+    // Verify category exists
+    const categoryCheck = await pool.query('SELECT id FROM categories WHERE slug = $1 AND is_active = true', [category_slug]);
+    if (categoryCheck.rows.length === 0) {
+      // Delete uploaded file if category doesn't exist
+      fs.unlinkSync(req.file.path);
+      return res.status(400).json({ success: false, error: 'Invalid or inactive category' });
     }
 
     // Construct file URL (relative to uploads directory)
     const fileUrl = `/uploads/templates/${req.file.filename}`;
 
     // Insert template into database
-    const initialStatus =
-      publishAt && publishAt.getTime() > Date.now() + 5_000
-        ? 'scheduled'
-        : 'draft';
-
-    const result = hasCategoryId
-      ? await pool.query(
-          `INSERT INTO templates (name, category_id, description, file_format, aspect_ratio, file_url, file_name, file_size, status, publish_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-           RETURNING *`,
-          [
-            name,
-            categoryId,
-            description || null,
-            file_format,
-            aspect_ratio,
-            fileUrl,
-            req.file.originalname,
-            req.file.size,
-            initialStatus,
-            publishAt ? publishAt.toISOString() : null,
-          ]
-        )
-      : await pool.query(
-          `INSERT INTO templates (name, category_slug, description, file_format, aspect_ratio, file_url, file_name, file_size, status, publish_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-           RETURNING *`,
-          [
-            name,
-            category_slug,
-            description || null,
-            file_format,
-            aspect_ratio,
-            fileUrl,
-            req.file.originalname,
-            req.file.size,
-            initialStatus,
-            publishAt ? publishAt.toISOString() : null,
-          ]
-        );
+    const result = await pool.query(
+      `INSERT INTO templates (name, category_slug, description, file_format, aspect_ratio, file_url, file_name, file_size, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       RETURNING *`,
+      [
+        name,
+        category_slug,
+        description || null,
+        file_format,
+        aspect_ratio,
+        fileUrl,
+        req.file.originalname,
+        req.file.size,
+        'draft' // Default to draft status
+      ]
+    );
 
     console.log('Template created successfully:', result.rows[0].id);
     res.json({ success: true, data: result.rows[0] });
@@ -2446,28 +1825,7 @@ app.get('/api/admin/templates', async (req, res) => {
   try {
     const { category, status, search } = req.query;
     
-    const hasCategoryId = await pool
-      .query(
-        `SELECT 1
-           FROM information_schema.columns
-          WHERE table_schema='public' AND table_name='templates' AND column_name='category_id'
-          LIMIT 1`
-      )
-      .then((r) => (r.rows?.length || 0) > 0)
-      .catch(() => true);
-
-    let query = hasCategoryId
-      ? `
-      SELECT 
-        t.*,
-        c.name as category_name,
-        c.icon as category_icon,
-        c.color as category_color
-      FROM templates t
-      LEFT JOIN categories c ON t.category_id = c.id
-      WHERE 1=1
-    `
-      : `
+    let query = `
       SELECT 
         t.*,
         c.name as category_name,
@@ -2477,18 +1835,12 @@ app.get('/api/admin/templates', async (req, res) => {
       LEFT JOIN categories c ON t.category_slug = c.slug
       WHERE 1=1
     `;
-
     const params = [];
     let paramIndex = 1;
 
     if (category && category !== 'all') {
-      if (hasCategoryId) {
-        query += ` AND c.slug = $${paramIndex++}`;
-        params.push(category);
-      } else {
-        query += ` AND t.category_slug = $${paramIndex++}`;
-        params.push(category);
-      }
+      query += ` AND t.category_slug = $${paramIndex++}`;
+      params.push(category);
     }
 
     if (status && status !== 'all') {
@@ -2525,9 +1877,6 @@ if (process.env.VERCEL !== '1') {
   app.listen(PORT, () => {
     console.log(`🚀 Server running on http://localhost:${PORT}`);
     console.log(`📱 API endpoints available at http://localhost:${PORT}/api`);
-    console.log(
-      `🔐 OTP_PROVIDER=${OTP_PROVIDER} (${isProduction ? 'production' : 'development'})`
-    );
   });
 }
 

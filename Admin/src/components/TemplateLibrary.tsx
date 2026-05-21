@@ -95,6 +95,12 @@ const TemplateLibrary: React.FC = () => {
   const [openMenuTemplateId, setOpenMenuTemplateId] = useState<string | null>(null);
   const [updatingId, setUpdatingId] = useState<string | null>(null);
   const [previewTemplate, setPreviewTemplate] = useState<Template | null>(null);
+  const [scheduleModal, setScheduleModal] = useState<{
+    open: boolean;
+    templateId: string | null;
+    value: string;
+    error: string | null;
+  }>({ open: false, templateId: null, value: '', error: null });
 
   useEffect(() => {
     fetchCategories();
@@ -212,6 +218,14 @@ const TemplateLibrary: React.FC = () => {
     }
   };
 
+  const toIsoFromDatetimeLocal = (value: string): string | null => {
+    const s = value.trim();
+    if (!s) return null;
+    const d = new Date(s);
+    if (Number.isNaN(d.getTime())) return null;
+    return d.toISOString();
+  };
+
   const handleDeleteTemplate = async (templateId: string) => {
     if (!confirm('Delete this template? This cannot be undone.')) return;
     try {
@@ -258,10 +272,44 @@ const TemplateLibrary: React.FC = () => {
       return 'bg-green-500/10 text-green-600 dark:text-green-400 border-green-500/20';
     } else if (statusLower === 'draft') {
       return 'bg-yellow-500/10 text-yellow-600 dark:text-yellow-400 border-yellow-500/20';
+    } else if (statusLower === 'scheduled') {
+      return 'bg-blue-500/10 text-blue-600 dark:text-blue-400 border-blue-500/20';
     } else if (statusLower === 'archived') {
       return 'bg-gray-500/10 text-gray-600 dark:text-gray-400 border-gray-500/20';
     }
     return 'bg-gray-500/10 text-gray-600 dark:text-gray-400 border-gray-500/20';
+  };
+
+  const openSchedulePublish = (templateId: string) => {
+    // Default to ~10 minutes from now (rounded to minutes) to avoid accidental "past" times.
+    const d = new Date(Date.now() + 10 * 60 * 1000);
+    d.setSeconds(0, 0);
+    const local = new Date(d.getTime() - d.getTimezoneOffset() * 60 * 1000).toISOString().slice(0, 16);
+    setScheduleModal({ open: true, templateId, value: local, error: null });
+  };
+
+  const submitSchedulePublish = async () => {
+    if (!scheduleModal.templateId) return;
+    const iso = toIsoFromDatetimeLocal(scheduleModal.value);
+    if (!iso) {
+      setScheduleModal((p) => ({ ...p, error: 'Please pick a valid date/time.' }));
+      return;
+    }
+    try {
+      setUpdatingId(scheduleModal.templateId);
+      await api.updateTemplate(scheduleModal.templateId, { publish_at: iso });
+      setOpenMenuTemplateId(null);
+      setScheduleModal({ open: false, templateId: null, value: '', error: null });
+      await fetchTemplates();
+    } catch (err) {
+      console.error('Schedule template publish error:', err);
+      setScheduleModal((p) => ({
+        ...p,
+        error: err instanceof Error ? err.message : 'Failed to schedule publish',
+      }));
+    } finally {
+      setUpdatingId(null);
+    }
   };
 
   const getCategoryBadgeClass = (color: string) => {
@@ -696,6 +744,15 @@ const TemplateLibrary: React.FC = () => {
                                   </button>
                                   <button
                                     type="button"
+                                    onClick={() => openSchedulePublish(template.id)}
+                                    disabled={updatingId === template.id}
+                                    className="w-full px-4 py-2 text-left text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800 disabled:opacity-50 flex items-center gap-2"
+                                  >
+                                    <span className="material-symbols-outlined text-[18px] text-blue-600">schedule</span>
+                                    Schedule Publish
+                                  </button>
+                                  <button
+                                    type="button"
                                     onClick={() => handleUpdateStatus(template.id, 'archived')}
                                     disabled={updatingId === template.id}
                                     className="w-full px-4 py-2 text-left text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800 disabled:opacity-50 flex items-center gap-2"
@@ -855,6 +912,77 @@ const TemplateLibrary: React.FC = () => {
                 {previewTemplate.description}
               </div>
             ) : null}
+          </div>
+        </div>
+      )}
+
+      {scheduleModal.open && (
+        <div
+          className="fixed inset-0 z-[210] flex items-center justify-center p-4 bg-black/70"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Schedule publish"
+          onClick={() => setScheduleModal({ open: false, templateId: null, value: '', error: null })}
+        >
+          <div
+            className="w-full max-w-md rounded-xl border border-gray-200 dark:border-[#29303b] bg-white dark:bg-[#1c242e] shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-start justify-between gap-3 px-5 py-4 border-b border-gray-200 dark:border-[#29303b]">
+              <div className="min-w-0">
+                <h3 className="text-lg font-semibold text-gray-900 dark:text-white">Schedule publish</h3>
+                <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                  Time is in your browser’s local timezone.
+                </p>
+              </div>
+              <button
+                type="button"
+                className="rounded-lg p-2 text-gray-400 hover:bg-gray-100 dark:hover:bg-white/10 hover:text-gray-700 dark:hover:text-white"
+                aria-label="Close"
+                onClick={() => setScheduleModal({ open: false, templateId: null, value: '', error: null })}
+              >
+                <span className="material-symbols-outlined text-[22px]">close</span>
+              </button>
+            </div>
+
+            <div className="px-5 py-4 flex flex-col gap-3">
+              <label className="text-sm font-medium text-gray-700 dark:text-gray-300" htmlFor="schedule-publish-at">
+                Publish at
+              </label>
+              <input
+                id="schedule-publish-at"
+                type="datetime-local"
+                className="w-full rounded-lg border-gray-300 bg-white dark:bg-[#11161d] dark:border-[#29303b] text-gray-900 dark:text-white shadow-sm focus:border-primary focus:ring-primary text-sm p-2.5"
+                value={scheduleModal.value}
+                onChange={(e) =>
+                  setScheduleModal((p) => ({ ...p, value: e.target.value, error: null }))
+                }
+              />
+              {scheduleModal.error ? (
+                <div className="rounded-lg border border-red-200 bg-red-50 text-red-700 px-3 py-2 text-sm">
+                  {scheduleModal.error}
+                </div>
+              ) : null}
+            </div>
+
+            <div className="px-5 py-4 border-t border-gray-200 dark:border-[#29303b] flex items-center justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => setScheduleModal({ open: false, templateId: null, value: '', error: null })}
+                className="px-4 py-2 rounded-lg text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors"
+                disabled={!!updatingId}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={submitSchedulePublish}
+                className="px-4 py-2 rounded-lg text-sm font-semibold bg-primary text-white hover:bg-blue-600 transition-colors disabled:opacity-60"
+                disabled={!!updatingId}
+              >
+                {updatingId ? 'Scheduling…' : 'Schedule'}
+              </button>
+            </div>
           </div>
         </div>
       )}

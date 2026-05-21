@@ -18,6 +18,14 @@ type NotificationItem = {
 
 type CategoryOption = { id: number | string; name: string; slug: string };
 
+function toIsoFromDatetimeLocal(value: string): string | null {
+  const s = value.trim();
+  if (!s) return null;
+  const d = new Date(s);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toISOString();
+}
+
 const NotificationsManager: React.FC = () => {
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
@@ -30,6 +38,7 @@ const NotificationsManager: React.FC = () => {
     tahsil: '',
     dataJson: '',
     categorySlug: '',
+    scheduleAt: '',
   });
 
   const [submitting, setSubmitting] = useState(false);
@@ -189,6 +198,11 @@ const NotificationsManager: React.FC = () => {
       setSubmitError(`Data JSON error: ${parsedData.error}`);
       return;
     }
+    const scheduleAtIso = toIsoFromDatetimeLocal(form.scheduleAt);
+    if (form.scheduleAt.trim() && !scheduleAtIso) {
+      setSubmitError('Schedule error: Please pick a valid date/time.');
+      return;
+    }
 
     setSubmitting(true);
     try {
@@ -201,10 +215,11 @@ const NotificationsManager: React.FC = () => {
         district: form.district.trim() ? form.district.trim() : null,
         tahsil: form.tahsil.trim() ? form.tahsil.trim() : null,
         ...(form.categorySlug.trim() ? { category_slug: form.categorySlug.trim() } : {}),
+        ...(scheduleAtIso ? { schedule_at: scheduleAtIso } : {}),
       });
 
-      setSubmitSuccess('Notification created.');
-      setForm(prev => ({ ...prev, title: '', body: '', dataJson: '', categorySlug: '' }));
+      setSubmitSuccess(scheduleAtIso ? 'Notification scheduled.' : 'Notification created.');
+      setForm(prev => ({ ...prev, title: '', body: '', dataJson: '', categorySlug: '', scheduleAt: '' }));
       await fetchNotifications();
     } catch (err: any) {
       setSubmitError(err?.message || 'Failed to create notification');
@@ -403,6 +418,22 @@ const NotificationsManager: React.FC = () => {
                     )}
                   </div>
 
+                  <div className="flex flex-col gap-2">
+                    <label className="text-sm font-medium text-slate-700 dark:text-slate-200">
+                      Schedule (optional)
+                    </label>
+                    <input
+                      type="datetime-local"
+                      className="w-full rounded-lg border border-border-light dark:border-[#3b4754] bg-white dark:bg-[#111418] px-3 py-2 text-slate-900 dark:text-white outline-none"
+                      value={form.scheduleAt}
+                      onChange={(e) => setForm(prev => ({ ...prev, scheduleAt: e.target.value }))}
+                      placeholder="YYYY-MM-DDThh:mm"
+                    />
+                    <p className="text-xs text-slate-500 dark:text-[#9dabb9]">
+                      Leave blank to send immediately. Time is in your browser’s local timezone.
+                    </p>
+                  </div>
+
                   <button
                     type="submit"
                     disabled={submitting}
@@ -410,7 +441,7 @@ const NotificationsManager: React.FC = () => {
                       submitting ? 'bg-slate-300 text-slate-700' : 'bg-primary text-white hover:bg-primary/90'
                     }`}
                   >
-                    {submitting ? 'Creating…' : 'Create Notification'}
+                    {submitting ? 'Creating…' : (form.scheduleAt.trim() ? 'Schedule Notification' : 'Create Notification')}
                   </button>
                 </form>
               </div>
